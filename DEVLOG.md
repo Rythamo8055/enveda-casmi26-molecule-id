@@ -52,9 +52,50 @@ The assistant fetched live competition metadata, schema, rules, and leaderboard,
 4. **Devlog & Repo Setup**: Maintain this `DEVLOG.md` as the source of truth for all architectural decisions, initialized with a public GitHub repository.
 
 ### 5. Decisions Left for Next Steps
-- [ ] **External Candidate DB Size vs Memory**: Determine the exact candidate database format (e.g., LMDB, Feather, Parquet, or SQLite with FAISS/HNSW indexing) that fits within Kaggle's 16 GB/30 GB RAM limits without internet access.
-- [ ] **Spectrum Encoder Backbone Selection**: Decide between:
-  - *Option A*: Binned peak representation with 1D-CNN / MLP.
-  - *Option B*: Peak list Transformer (treating $m/z$ and intensity as continuous tokens, e.g. MassFormer / DreaMS style).
-- [ ] **Collision Energy & Adduct Conditioning**: Choose whether to embed collision energy (`collision_energy_ev`) and adduct types as conditioning tokens or to normalize fragmentation patterns across energies.
-- [ ] **Baseline Implementation**: Build the Tier-1 spectral library matcher first to establish an empirical local CV score and verify submission pipeline validity.
+- [x] **Local Environment Setup**: Verified system specs and created `.venv` via `uv` containing RDKit, Polars, Matchms, Scipy, and Numba.
+- [x] **Baseline Implementation**: Built Tier-1 spectral library matcher and end-to-end submission pipeline.
+- [ ] **External Candidate DB Size vs Memory**: Determine the candidate database format (e.g., SQLite/Parquet indexed by mass) that fits within Kaggle's memory limits without internet access.
+- [ ] **Spectrum Encoder Backbone Selection**: Choose between Peak list Transformer vs binned representations for Tier 2.
+- [ ] **Collision Energy & Adduct Conditioning**: Choose embedding strategy for multi-energy spectra.
+
+---
+
+## Session 02: System Capability Verification & Baseline Implementation
+- **Date**: 2026-09-15
+- **Context**: Selecting baseline strategy, auditing local hardware, and implementing the Tier-1 Spectral Library Matcher.
+
+### 1. User Request
+- Define the roadmap to build a competitive, winning solution.
+- Verify whether the user's system supports the required development stack (`rdkit`, `matchms`, `scipy`, `numpy`, `polars`, `pyarrow`, `torch`).
+- Selected **Option 1 (Fast Spectral Matching Baseline)** to implement first.
+
+### 2. Submitted Proposals
+1. **Hardware & Capability Audit**:
+   - Analyzed local system: Linux (Fedora 44 / x86_64), 16 vCPUs (13th Gen Intel Core i7-1360P), 15 GiB RAM, 233 GiB available NVMe SSD.
+   - Result: Fully supported for rapid local feature processing, spectral indexing, and CPU inference, with Kaggle GPU resources available for heavy deep learning runs.
+2. **5-Pillar Winning Strategy**:
+   - Pillar 1: High-accuracy mass de-convolution & adduct offset calculation ($\pm 10\text{ ppm}$).
+   - Pillar 2: High-precision spectral library engine for Class 1 (entropy/cosine similarity).
+   - Pillar 3: MS-to-Fingerprint retrieval with offline candidate database (COCONUT/PubChem) for Class 2.
+   - Pillar 4: De novo generative model (Seq2Seq Transformer) for Class 3.
+   - Pillar 5: Multi-spectrum aggregation and strict `InChIKey14` candidate deduplication.
+3. **Execution Choice**:
+   - Evaluated Option 1 (Fast Spectral Matching baseline) vs Option 2 (Direct Deep Learning). Option 1 establishes an immediate empirical score and verified submission pipeline.
+
+### 3. Selection Criteria
+- **Execution Speed & Simplicity**: Fast library search establishes an end-to-end baseline in minutes and tests the full submission format.
+- **Metric Fit**: Exact mass + cosine similarity provides high precision on Class 1 molecules, directly targeting the initial public LB benchmark (~0.285).
+- **Environment Stability**: Pinned `rdkit==2026.3.6` matches Kaggle's evaluation environment.
+
+### 4. Final Decision
+1. **Configured Local Environment via `uv`**: Installed `rdkit`, `matchms`, `polars`, `pyarrow`, `scipy`, `numpy`, and `numba` into `.venv`.
+2. **Implemented Preprocessing & Adduct Tables**: Created `src/preprocessing/adducts.py` supporting all 10 competition adducts, neutral mass conversion, and ppm tolerance checking.
+3. **Implemented Numba-Accelerated Matcher**: Created `src/retrieval/spectral_matcher.py` featuring square-root weighted cosine similarity and binary search indexing (`SpectralLibraryIndex`).
+4. **Built End-to-End Pipeline**: Created `src/pipeline.py` with multi-spectrum aggregation per `molecule_id` and strict `InChIKey14` deduplication, verified against synthetic test data.
+
+### 5. Decisions Left for Next Steps
+- [ ] **Accept Kaggle Rules**: Accept terms on the Kaggle web interface to allow CLI downloading of `train.parquet` and `test.parquet`.
+- [ ] **Benchmark on Local CV**: Run the spectral matcher on `enveda-np-examples` to record our first local MRR@25 baseline score.
+- [ ] **Self-Contained Notebook**: Generate a standalone Kaggle Notebook script (`notebooks/baseline_submission.py`) ready for 1-click submission.
+- [ ] **Phase 2 Candidate Database**: Curate and index open natural products (COCONUT 2.0 / LOTUS) by neutral mass for Class 2 retrieval.
+
