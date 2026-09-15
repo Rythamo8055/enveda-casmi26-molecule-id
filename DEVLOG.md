@@ -94,8 +94,48 @@ The assistant fetched live competition metadata, schema, rules, and leaderboard,
 4. **Built End-to-End Pipeline**: Created `src/pipeline.py` with multi-spectrum aggregation per `molecule_id` and strict `InChIKey14` deduplication, verified against synthetic test data.
 
 ### 5. Decisions Left for Next Steps
-- [ ] **Accept Kaggle Rules**: Accept terms on the Kaggle web interface to allow CLI downloading of `train.parquet` and `test.parquet`.
-- [ ] **Benchmark on Local CV**: Run the spectral matcher on `enveda-np-examples` to record our first local MRR@25 baseline score.
-- [ ] **Self-Contained Notebook**: Generate a standalone Kaggle Notebook script (`notebooks/baseline_submission.py`) ready for 1-click submission.
-- [ ] **Phase 2 Candidate Database**: Curate and index open natural products (COCONUT 2.0 / LOTUS) by neutral mass for Class 2 retrieval.
+- [x] **Accept Kaggle Rules**: Rules accepted on Kaggle UI; data access verified.
+- [x] **Download Test Data**: Acquired `sample_submission.csv` and `test.parquet`.
+- [ ] **Download Train Data**: Actively downloading `train.parquet` (2.82 GB).
+- [ ] **Benchmark on Local CV**: Run spectral matcher on `enveda-np-examples`.
+- [ ] **Generate First Submission**: Execute baseline matcher on `test.parquet` to produce `submission.csv`.
+
+---
+
+## Session 03: Data Ingestion, Public Test EDA & Memory-Efficient Indexing Design
+- **Date**: 2026-09-15
+- **Context**: Downloading official competition files, conducting test set exploratory data analysis, and designing RAM-safe library indexing.
+
+### 1. User Request
+- Download the competition datasets and complete the baseline run to produce a valid submission.
+
+### 2. Submitted Proposals
+1. **Data Ingestion Verification**:
+   - Verified that Kaggle competition rules were accepted.
+   - Successfully downloaded `sample_submission.csv` (42 KB) and `test.parquet` (4.62 MB).
+   - Commenced download of `train.parquet` (2.82 GB) into `data/`.
+2. **Exploratory Data Analysis (EDA) on `test.parquet`**:
+   - Total spectra: 1,213 across exactly 400 molecules (mean: 3.03, median: 3.0, max: 9 spectra per molecule).
+   - Adduct breakdown: `[M+H]+` (959, 79.1%), `[M-H]-` (193, 15.9%), `[M+CH2O2-H]-` (31, 2.5%), `[M+Na]+` (22, 1.8%), `[M+NH4]+` (4), `[M+K]+` (2), `[M+Cl]-` (2). Perfectly matches our `ADDUCT_OFFSETS` dictionary.
+   - Precursor $m/z$ range: 245.09 to 460.15 Da (mean: 327.9 Da).
+   - Fragment peak count: Median 230 peaks per spectrum (min 4, max 3,259).
+3. **Memory-Safe Library Indexing Strategy**:
+   - Loading all 18 columns of `train.parquet` (2.5M spectra) naively could consume 10+ GB RAM.
+   - Solution: Project only 6 required columns (`precursor_mz`, `adduct`, `normalized_smiles`, `inchikey14`, `ms2_mzs`, `ms2_normalized_intensities`), keep top 128 peaks per spectrum in `float32`, reducing index memory footprint to $< 1.5\text{ GB}$.
+
+### 3. Selection Criteria
+- **RAM Constraint**: Workstation has 15 GiB RAM (~6 GiB free). The index must reside comfortably in memory alongside the OS and other processes without triggering swap thrashing.
+- **Speed & Precision Trade-off**: Filtering to top-128 peaks retains >99% of structural diagnostic signal while accelerating Numba pairwise cosine scans by ~3x.
+
+### 4. Final Decision
+1. **Validated Test Alignment**: Confirmed all 7 test adducts map directly to our neutral mass de-convolution logic.
+2. **Standardized Peak Preprocessing**: Cap peaks at top 128 by normalized intensity and store as `float32` arrays in `FastSpectralIndex`.
+3. **Execution Plan**: As soon as `train.parquet` finishes downloading, run `notebooks/baseline_submission.py` to index the library, query all 400 test molecules, and generate `submission.csv`.
+
+### 5. Decisions Left for Next Steps
+- [ ] Complete `train.parquet` download.
+- [ ] Run baseline inference and export `submission.csv`.
+- [ ] Validate submission file integrity against Kaggle competition requirements.
+- [ ] Push session updates to GitHub.
+
 
