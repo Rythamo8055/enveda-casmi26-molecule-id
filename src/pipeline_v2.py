@@ -21,6 +21,8 @@ from src.models.spectrum_dataset import parse_collision_energy
 from src.preprocessing.adducts import calculate_neutral_mass
 from src.retrieval.spectral_matcher import SpectralLibraryIndex as FastSpectralIndex
 from src.retrieval.substructure_scorer import score_candidate_by_fragmentation
+from src.models.de_novo_assembler import DeNovoScaffoldAssembler
+
 
 
 class ContrastiveHybridPipeline:
@@ -98,7 +100,11 @@ class ContrastiveHybridPipeline:
         self.spec_encoder.eval()
         self.mol_encoder.eval()
 
+        # 3. CPU De Novo Scaffold Assembler (Tier 3)
+        self.de_novo_assembler = DeNovoScaffoldAssembler()
+
     def predict_molecule(
+
         self,
         spectra: List[Dict[str, any]],
         ppm_tol: float = 15.0,
@@ -296,6 +302,44 @@ class ContrastiveHybridPipeline:
                     ):
                         candidate_scores[canonical_k14] = (c_smi, tier2_score)
 
+        # ---------------------------------------------------------
+        # STAGE 3: Tier 3 CPU De Novo Scaffold Assembly (Class 3 Novelty)
+        # ---------------------------------------------------------
+        if len(candidate_scores) < max_cands and neutral_masses:
+            mean_nm = float(np.median(neutral_masses))
+            best_spec = max(
+                spectra, key=lambda s: len(s["mzs"]) if s["mzs"] is not None else 0
+            )
+            rep_mzs = best_spec["mzs"]
+            rep_ints = best_spec["ints"]
+            rep_prec = best_spec["precursor_mz"]
+
+            # Use retrieved candidates as parent seed scaffolds
+            seed_scaffolds = [c[0] for c in candidate_scores.values()]
+
+            # Also query modified cosine analog scaffolds from spectral library
+            if self.spectral_index is not None and len(seed_scaffolds) < 5:
+                for s in spectra:
+                    analog_hits = self.spectral_index.query_analog(
+                        s["precursor_mz"], s["adduct"], s["mzs"], s["ints"], max_mass_shift=80.0, top_k=5
+                    )
+                    for a_smi, a_k14, a_sim in analog_hits:
+                        seed_scaffolds.append(a_smi)
+
+            if seed_scaffolds:
+                needed = max_cands - len(candidate_scores)
+                de_novo_hits = self.de_novo_assembler.generate_de_novo_candidates(
+                    parent_scaffolds=seed_scaffolds[:10],
+                    target_neutral_mass=mean_nm,
+                    query_mzs=rep_mzs,
+                    query_ints=rep_ints,
+                    precursor_mz=rep_prec,
+                    ppm_tol=ppm_tol,
+                    max_cands=needed,
+                )
+                for d_smi, d_k14, d_score in de_novo_hits:
+                    if d_k14 not in candidate_scores:
+                        candidate_scores[d_k14] = (d_smi, d_score)
 
         if not candidate_scores:
             return ""
@@ -304,6 +348,7 @@ class ContrastiveHybridPipeline:
         ranked = sorted(
             candidate_scores.values(), key=lambda x: x[1], reverse=True
         )
+
         top_smiles = [c[0] for c in ranked[:max_cands]]
         return ";".join(top_smiles)
 
