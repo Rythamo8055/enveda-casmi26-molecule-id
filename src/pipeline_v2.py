@@ -23,6 +23,7 @@ from src.retrieval.spectral_matcher import SpectralLibraryIndex as FastSpectralI
 from src.retrieval.substructure_scorer import score_candidate_by_fragmentation
 from src.models.de_novo_assembler import DeNovoScaffoldAssembler
 from src.retrieval.learned_ranker import LearnedCandidateRanker
+from src.retrieval.deterministic_ranker import DeterministicCandidateRanker
 from src.retrieval.mass_calibration import get_instrument_ppm_tolerance
 from src.retrieval.feature_extractor import extract_candidate_features
 
@@ -112,6 +113,11 @@ class ContrastiveHybridPipeline:
             model_path="models/lambdamart_ranker.txt",
         )
 
+        # 5. Upgraded Deterministic Advanced Physics Ranker (Tier 2 Primary Engine)
+        self.deterministic_ranker = DeterministicCandidateRanker(
+            coconut_parquet_path=coconut_parquet_path
+        )
+
     def predict_molecule(
 
         self,
@@ -153,183 +159,31 @@ class ContrastiveHybridPipeline:
                         candidate_scores[k14] = (smi, tier1_score)
 
         # ---------------------------------------------------------
-        # STAGE 2: Tier 2 Contrastive Retrieval with RRF
+        # STAGE 2: Tier 2 Advanced Physics Retrieval (COCONUT)
         # ---------------------------------------------------------
-        # Find candidate molecules from COCONUT matching precursor mass
         inst_type = spectra[0].get("instrument_type") if spectra else None
         effective_ppm = get_instrument_ppm_tolerance(inst_type, default_ppm=ppm_tol)
+        effective_ppm = max(effective_ppm, 10.0)
 
-        neutral_masses = []
-        for s in spectra:
-            nm = calculate_neutral_mass(s["precursor_mz"], s["adduct"])
-            if nm is not None and nm > 0:
-                neutral_masses.append(nm)
-
-        if neutral_masses:
-            mean_nm = float(np.median(neutral_masses))
-            delta = mean_nm * effective_ppm * 1e-6
-            left = np.searchsorted(self.coco_masses, mean_nm - delta, side="left")
-            right = np.searchsorted(
-                self.coco_masses, mean_nm + delta, side="right"
-            )
-
-            cand_smiles_slice = self.coco_smiles[left:right]
-            cand_keys_slice = self.coco_keys[left:right]
-            cand_masses_slice = self.coco_masses[left:right]
-
-            # Collect candidate fingerprints
-            cand_fps_list = []
-            valid_cands = []
-            for c_smi, c_k14, c_mass in zip(cand_smiles_slice, cand_keys_slice, cand_masses_slice):
-                if c_smi not in self.fp_cache:
-                    c_fp = compute_molecule_fingerprint(c_smi, n_bits=2048)
-                    self.fp_cache[c_smi] = (
-                        c_fp
-                        if c_fp is not None
-                        else np.zeros(2048, dtype=np.float32)
-                    )
-                fp_arr = self.fp_cache[c_smi]
-                if fp_arr.sum() > 0:
-                    cand_fps_list.append(fp_arr)
-                    valid_cands.append((c_smi, c_k14, c_mass))
-
-            if valid_cands:
-                cand_fps_tensor = torch.from_numpy(
-                    np.array(cand_fps_list, dtype=np.float32)
-                ).to(self.device)
-                with torch.no_grad():
-                    mol_latents = self.mol_encoder(
-                        cand_fps_tensor
-                    )  # (N_cands, d_latent)
-
-                # Track Reciprocal Rank Fusion scores across spectra
-                # rrf_scores[idx] = sum_s (weight_s / (rrf_k + rank_s))
-                rrf_scores = np.zeros(len(valid_cands), dtype=np.float32)
-
-                for s in spectra:
-                    mzs = s["mzs"]
-                    ints = s["ints"]
-                    prec_mz = s["precursor_mz"]
-                    ce_feat = s["ce_feat"]
-                    inst_idx = s["inst_idx"]
-
-                    # Information entropy of spectrum to weight clean, rich spectra higher
-                    if len(ints) > 0 and ints.sum() > 0:
-                        norm_ints = ints / ints.sum()
-                        spec_entropy = -float(
-                            np.sum(norm_ints * np.log(norm_ints + 1e-12))
-                        )
-                        spec_weight = 1.0 + min(spec_entropy / 3.0, 1.5)
-                    else:
-                        spec_weight = 1.0
-
-                    # Prepare peak tensors for Peak Transformer
-                    n_p = max(len(mzs), 1)
-                    padded_mzs = np.zeros((1, n_p), dtype=np.float32)
-                    padded_ints = np.zeros((1, n_p), dtype=np.float32)
-                    mask = np.zeros((1, n_p), dtype=bool)
-
-                    if len(mzs) > 0:
-                        padded_mzs[0, : len(mzs)] = mzs
-                        padded_ints[0, : len(ints)] = ints
-                        mask[0, : len(mzs)] = True
-
-                    with torch.no_grad():
-                        spec_latent, _ = self.spec_encoder(
-                            torch.from_numpy(padded_mzs).to(self.device),
-                            torch.from_numpy(padded_ints).to(self.device),
-                            torch.from_numpy(mask).to(self.device),
-                            torch.tensor([prec_mz], dtype=torch.float32).to(
-                                self.device
-                            ),
-                            torch.from_numpy(ce_feat).unsqueeze(0).to(
-                                self.device
-                            ),
-                            torch.tensor([inst_idx], dtype=torch.int64).to(
-                                self.device
-                            ),
-                        )
-                        # Cosine similarities: (1, d) @ (N, d).T -> (N,)
-                        sims = (
-                            torch.matmul(spec_latent, mol_latents.T)
-                            .squeeze(0)
-                            .cpu()
-                            .numpy()
-                        )
-
-                    # Determine ranking for this specific spectrum
-                    ranking_order = np.argsort(-sims)
-                    for rank, cand_idx in enumerate(ranking_order, start=1):
-                        rrf_scores[cand_idx] += spec_weight / (rrf_k + rank)
-
-                # Select best representative spectrum for in-silico fragmentation scoring
-                best_spec = max(
-                    spectra, key=lambda s: len(s["mzs"]) if s["mzs"] is not None else 0
-                )
-                rep_mzs = best_spec["mzs"]
-                rep_ints = best_spec["ints"]
-                rep_prec = best_spec["precursor_mz"]
-
-                # Generate plausible molecular formulas (Seven Golden Rules)
-                from src.preprocessing.formula_generator import generate_plausible_formulas
-                from rdkit.Chem import rdMolDescriptors
-                formulas = generate_plausible_formulas(mean_nm, ppm_tol=effective_ppm, max_candidates=10)
-                formula_map = {f.formula: f.score for f in formulas}
-
-                # Combine RRF score with learned LambdaMART / substructure features
-                for cand_idx, (c_smi, c_k14, c_mass) in enumerate(valid_cands):
-                    # Skip if already high-confidence Tier 1 match
-                    if (
-                        c_k14 in candidate_scores
-                        and candidate_scores[c_k14][1] >= 5.0
-                    ):
-                        continue
-
-                    r_score = float(rrf_scores[cand_idx])
-
-                    if self.learned_ranker.booster is not None:
-                        feat = extract_candidate_features(
-                            candidate_smiles=c_smi,
-                            candidate_mass=c_mass,
-                            query_mzs=rep_mzs,
-                            query_intensities=rep_ints,
-                            precursor_mz=rep_prec,
-                            consensus_neutral_mass=mean_nm,
-                            formula_score_map=formula_map,
-                        )
-                        learned_score = float(self.learned_ranker.booster.predict(feat[np.newaxis, :])[0])
-                        tier2_score = learned_score + 0.50 * (r_score * 10.0)
-                    else:
-                        frag_score = score_candidate_by_fragmentation(
-                            c_smi, rep_mzs, rep_ints, precursor_mz=rep_prec
-                        )
-                        try:
-                            mol = Chem.MolFromSmiles(c_smi)
-                            c_form = rdMolDescriptors.CalcMolFormula(mol) if mol else ""
-                        except Exception:
-                            c_form = ""
-                        formula_bonus = formula_map.get(c_form, 0.0)
-
-                        # Tier 2 combined score: 50% contrastive RRF + 30% fragmentation explainer + 20% formula prior
-                        tier2_score = (
-                            0.50 * (r_score * 10.0)
-                            + 0.30 * frag_score
-                            + 0.20 * min(formula_bonus, 1.0)
-                        )
-
-                    canonical_k14 = smiles_to_inchikey14(c_smi)
-                    if not canonical_k14:
-                        continue
-
-                    if (
-                        canonical_k14 not in candidate_scores
-                        or tier2_score > candidate_scores[canonical_k14][1]
-                    ):
-                        candidate_scores[canonical_k14] = (c_smi, tier2_score)
+        # Multi-energy consensus, base peak explanation, diagnostic neutral loss, calibrated mass
+        det_hits = self.deterministic_ranker.rank_candidates(
+            spectra, ppm_tol=effective_ppm, max_cands=max_cands
+        )
+        for c_smi, c_k14, c_score in det_hits:
+            if (
+                c_k14 not in candidate_scores
+                or c_score > candidate_scores[c_k14][1]
+            ):
+                candidate_scores[c_k14] = (c_smi, c_score)
 
         # ---------------------------------------------------------
         # STAGE 3: Tier 3 CPU De Novo Scaffold Assembly (Class 3 Novelty)
         # ---------------------------------------------------------
+        neutral_masses = [
+            calculate_neutral_mass(s["precursor_mz"], s["adduct"])
+            for s in spectra
+            if calculate_neutral_mass(s["precursor_mz"], s["adduct"]) is not None
+        ]
         if len(candidate_scores) < max_cands and neutral_masses:
             mean_nm = float(np.median(neutral_masses))
             best_spec = max(
@@ -365,6 +219,34 @@ class ContrastiveHybridPipeline:
                 for d_smi, d_k14, d_score in de_novo_hits:
                     if d_k14 not in candidate_scores:
                         candidate_scores[d_k14] = (d_smi, d_score)
+
+        # ---------------------------------------------------------
+        # STAGE 4: Fallback Padding to guarantee exactly max_cands
+        # ---------------------------------------------------------
+        if len(candidate_scores) < max_cands and neutral_masses:
+            mean_nm = float(np.median(neutral_masses))
+            wide_delta = mean_nm * 50.0 * 1e-6
+            w_left = np.searchsorted(self.coco_masses, mean_nm - wide_delta, side="left")
+            w_right = np.searchsorted(self.coco_masses, mean_nm + wide_delta, side="right")
+            for c_smi, c_k14, c_mass in zip(
+                self.coco_smiles[w_left:w_right],
+                self.coco_keys[w_left:w_right],
+                self.coco_masses[w_left:w_right],
+            ):
+                if c_k14 not in candidate_scores:
+                    ppm_diff = abs(c_mass - mean_nm) / mean_nm * 1e6
+                    pad_score = float(np.exp(-0.5 * (ppm_diff / 20.0) ** 2)) * 0.05
+                    candidate_scores[c_k14] = (c_smi, pad_score)
+                    if len(candidate_scores) >= max_cands:
+                        break
+
+        # Final safety net: pad from COCONUT head if still needed
+        if len(candidate_scores) < max_cands:
+            for c_smi, c_k14 in zip(self.coco_smiles, self.coco_keys):
+                if c_k14 not in candidate_scores:
+                    candidate_scores[c_k14] = (c_smi, 0.0001)
+                    if len(candidate_scores) >= max_cands:
+                        break
 
         if not candidate_scores:
             return ""

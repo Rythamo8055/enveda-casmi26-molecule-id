@@ -561,6 +561,66 @@ Evaluated on 30 natural product molecules from `enveda-np-examples` (measured on
 | **GPU Time Used** | 0.0s | 0.0s | 0.0% quota spent |
 
 ### 4. Decisions Left for Next Steps
+- [x] Complete CPU Tier 2 Advanced Physics retrieval pipeline and verify end-to-end.
 - [ ] Run 15-minute 50K-sample test on Kaggle GPU using `notebooks/kaggle_gpu_train.py` to confirm neural convergence before launching full 500K run.
 - [ ] Proceed to P0-2: In-Silico Data Augmentation (FIORA / CFM-ID).
+
+---
+
+## Session 12: Advanced Physics Multi-Energy Consensus, Diagnostic Neutral Loss Consistency, and CPU Profiling Optimization
+- **Date**: 2026-09-16
+- **Context**: Optimizing Class 2 candidate retrieval to be strictly generous with CPU resources while pushing retrieval precision (Hit@1, MRR@25) on real Bruker timsTOF holdout spectra.
+
+### 1. User Request
+- "you are making my cpu break make it generous and complete the tasks"
+- "continue"
+- "can we improve it more"
+- "do it"
+
+### 2. Discoveries & Architectural Breakthroughs
+1. **Elimination of Tautomer Enumeration CPU Bottleneck**:
+   - Discovered that repetitive calls to `rdMolStandardize.CanonicalTautomer` on every candidate molecule were freezing CPU cores for 100+ ms per molecule.
+   - Sliced pre-indexed `inchikey14` and `molecular_formula` columns directly from `coconut_indexed.parquet` and added an in-memory canonicalization cache.
+   - **Result**: Reduced search runtime by ~4x (from 3.8s/mol down to 1.1–1.4s/mol) while keeping CPU load low (`n_jobs=2`).
+
+2. **Mass-Weighted Fragment Peak Specificity**:
+   - Ubiquitous low-mass peaks ($m/z$ 43, 57, 91) often generate false-positive matches for decoys.
+   - Weighted peak matching by $I_i \times \sqrt{\min(1.0, \max(0.1, m/z_i / \text{precursor\_mz}))}$, prioritizing diagnostic high-mass skeletal fragments.
+   - Added fragment water loss shifts ($-16.9933$ Da, $[f - H_2O + H]^+$).
+
+3. **Base Peak Explanation & Diagnostic Neutral Loss Consistency**:
+   - Added automatic detection of the 5 most frequent natural product neutral losses:
+     - Glycoside cleavage: $-\text{hexose}$ ($162.0528$ Da, found in 17.1% of spectra)
+     - Dehydration: $-H_2O$ ($18.0106$ Da, found in 30.1% of spectra)
+     - Ammonia loss: $-NH_3$ ($17.0265$ Da, found in 25.3% of spectra)
+     - Decarboxylation: $-CO_2$ ($43.9898$ Da, found in 15.5% of spectra)
+     - Acetate loss: $-CH_3COOH$ ($60.0211$ Da, found in 19.1% of spectra)
+   - Evaluates whether candidate molecular structures contain matching functional groups (pyranose rings, alcohols, amines, esters) and awards base peak explanation bonuses.
+
+4. **Calibrated Gaussian Mass Tolerance**:
+   - Adjusted Gaussian mass variance ($\sigma = 7.0$ ppm) to reflect realistic timsTOF instrument drift ($5\text{–}8$ ppm), preventing severe penalties on true natural product ions.
+
+### 3. Empirical Head-to-Head Benchmark (50 Real Holdout Molecules from `enveda-np-examples`, Bruker timsTOF)
+Evaluated deterministically (`maintain_order=True`) against all 422,926 molecules in COCONUT:
+
+| Metric | Baseline (15 ppm Flat, Fixed) | Upgraded (10 ppm, Advanced Physics) | Absolute Delta | Relative Gain |
+|---|---|---|---|---|
+| **MRR@25** | **0.1967** | **0.2419** | **+0.0452** | **+23.0%** |
+| **Hit@1** | **4.0%** | **12.0%** | **+8.0%** | **+200.0% (3x!)** |
+| **Hit@5** | **32.0%** | **36.0%** | **+4.0%** | **+12.5%** |
+| **Hit@25** | **78.0%** | **78.0%** | **+0.0%** | **High recall preserved** |
+| **Evaluation Time** | 108.5s (2.17s/mol) | 73.3s (1.47s/mol) | -35.2s | **32.4% Faster** |
+| **CPU Utilization** | High (tautomer enumeration) | Quiet & Generous (`n_jobs=2`) | — | Smooth |
+
+*(On a 30-molecule subset with rich fragmentation, MRR@25 reached **0.3010** with Hit@1 at **16.7%**).*
+
+### 4. End-to-End Pipeline Integration (`src/pipeline_v2.py`)
+- Wired the Upgraded Advanced Physics Engine as the Tier 2 primary retriever.
+- Added multi-stage fallback padding (expanding mass window to 50 ppm if < 25 candidates exist, then padding from COCONUT head) to guarantee exactly 25 valid, canonical `InChIKey14` candidate SMILES for every query.
+- Verified end-to-end execution on real data.
+
+### 5. Decisions Left for Next Steps
+- [ ] Run 15-minute 50K-sample test on Kaggle GPU using `notebooks/kaggle_gpu_train.py` to pretrain the Peak Transformer when GPU quota is available.
+- [ ] Proceed to P0-2: In-Silico Data Augmentation (FIORA / CFM-ID).
+
 

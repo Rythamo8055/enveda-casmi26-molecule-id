@@ -23,6 +23,7 @@ from src.preprocessing.adducts import calculate_neutral_mass
 from src.preprocessing.formula_generator import generate_plausible_formulas
 from src.retrieval.feature_extractor import extract_candidate_features, FEATURE_NAMES
 from src.retrieval.mass_calibration import get_instrument_ppm_tolerance
+from src.retrieval.adduct_hypotheses import get_adduct_hypotheses
 
 
 class LearnedCandidateRanker:
@@ -221,9 +222,24 @@ class LearnedCandidateRanker:
         left = np.searchsorted(self.coco_masses, consensus_nm - delta, side="left")
         right = np.searchsorted(self.coco_masses, consensus_nm + delta, side="right")
 
-        cand_smiles_slice = self.coco_smiles[left:right]
-        cand_keys_slice = self.coco_keys[left:right]
-        cand_masses_slice = self.coco_masses[left:right]
+        cand_smiles_slice = list(self.coco_smiles[left:right])
+        cand_keys_slice = list(self.coco_keys[left:right])
+        cand_masses_slice = list(self.coco_masses[left:right])
+        cand_target_masses = [consensus_nm] * len(cand_smiles_slice)
+
+        # Multi-adduct hypothesis recovery (in-source water loss [M-H2O+H]+, [M+Na]+, etc.)
+        if len(cand_smiles_slice) < 5 and spectra:
+            first_spec = spectra[0]
+            hypotheses = get_adduct_hypotheses(first_spec["precursor_mz"], first_spec.get("adduct", "[M+H]+"))
+            for alt_adduct, alt_nm in hypotheses[1:]:
+                alt_delta = alt_nm * ppm_tol * 1e-6
+                alt_l = np.searchsorted(self.coco_masses, alt_nm - alt_delta, side="left")
+                alt_r = np.searchsorted(self.coco_masses, alt_nm + alt_delta, side="right")
+                if alt_r > alt_l:
+                    cand_smiles_slice.extend(self.coco_smiles[alt_l:alt_r])
+                    cand_keys_slice.extend(self.coco_keys[alt_l:alt_r])
+                    cand_masses_slice.extend(self.coco_masses[alt_l:alt_r])
+                    cand_target_masses.extend([alt_nm] * (alt_r - alt_l))
 
         if len(cand_smiles_slice) == 0:
             return []
@@ -245,7 +261,7 @@ class LearnedCandidateRanker:
         features_list = []
         valid_candidates = []
 
-        for c_smi, c_k14, c_mass in zip(cand_smiles_slice, cand_keys_slice, cand_masses_slice):
+        for c_smi, c_k14, c_mass, target_nm in zip(cand_smiles_slice, cand_keys_slice, cand_masses_slice, cand_target_masses):
             canonical_k14 = smiles_to_inchikey14(c_smi)
             if not canonical_k14:
                 continue
@@ -256,7 +272,7 @@ class LearnedCandidateRanker:
                 query_mzs=rep_mzs,
                 query_intensities=rep_ints,
                 precursor_mz=rep_prec,
-                consensus_neutral_mass=consensus_nm,
+                consensus_neutral_mass=target_nm,
                 formula_score_map=formula_map,
             )
             features_list.append(feat)

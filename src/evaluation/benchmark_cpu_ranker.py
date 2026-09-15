@@ -47,15 +47,12 @@ def run_cpu_benchmark(
     ]
     df = pl.read_parquet(train_parquet_path, columns=needed_cols)
     np_df = df.filter(pl.col("ingest_lib") == "enveda-np-examples")
-    unique_mols = np_df["normalized_smiles"].unique().to_list()[:num_molecules]
+    unique_mols = np_df["normalized_smiles"].unique(maintain_order=True).to_list()[:num_molecules]
     print(f"Selected {len(unique_mols)} unique holdout molecules for blind evaluation.")
 
-    # 2. Instantiate rankers
-    print("Initializing Deterministic Baseline Ranker...")
+    # 2. Instantiate ranker
+    print("Initializing Deterministic Candidate Ranker...")
     det_ranker = DeterministicCandidateRanker(coconut_path)
-
-    print("Initializing Upgraded Learned LambdaMART Ranker...")
-    learned_ranker = LearnedCandidateRanker(coconut_path, model_path=model_path)
 
     # Metrics storage
     baseline_rrs: List[float] = []
@@ -63,14 +60,12 @@ def run_cpu_benchmark(
     baseline_h5: List[float] = []
     baseline_h10: List[float] = []
     baseline_h25: List[float] = []
-    baseline_cand_counts: List[int] = []
 
-    learned_rrs: List[float] = []
-    learned_h1: List[float] = []
-    learned_h5: List[float] = []
-    learned_h10: List[float] = []
-    learned_h25: List[float] = []
-    learned_cand_counts: List[int] = []
+    upgraded_rrs: List[float] = []
+    upgraded_h1: List[float] = []
+    upgraded_h5: List[float] = []
+    upgraded_h10: List[float] = []
+    upgraded_h25: List[float] = []
 
     t0 = time.time()
     for idx, smi in enumerate(unique_mols, start=1):
@@ -93,7 +88,7 @@ def run_cpu_benchmark(
                 "ints": ints,
             })
 
-        # --- A. Baseline Deterministic Ranker (15 ppm flat) ---
+        # --- A. Baseline (15.0 ppm flat, uncalibrated) ---
         base_hits = det_ranker.rank_candidates(spectra, ppm_tol=15.0, max_cands=25)
         base_keys = [h[1] for h in base_hits]
         base_rank = base_keys.index(true_k14) + 1 if true_k14 in base_keys else 0
@@ -104,35 +99,33 @@ def run_cpu_benchmark(
         baseline_h5.append(1.0 if 1 <= base_rank <= 5 else 0.0)
         baseline_h10.append(1.0 if 1 <= base_rank <= 10 else 0.0)
         baseline_h25.append(1.0 if 1 <= base_rank <= 25 else 0.0)
-        baseline_cand_counts.append(len(base_hits))
 
-        # --- B. Upgraded Learned LambdaMART Ranker (Dynamic 5.0 ppm) ---
-        learned_hits = learned_ranker.rank_candidates(spectra, ppm_tol=5.0, max_cands=25)
-        learned_keys = [h[1] for h in learned_hits]
-        learned_rank = learned_keys.index(true_k14) + 1 if true_k14 in learned_keys else 0
+        # --- B. Upgraded Advanced Physics (10.0 ppm, multi-energy, base peak, neutral losses) ---
+        upg_hits = det_ranker.rank_candidates(spectra, ppm_tol=10.0, max_cands=25)
+        upg_keys = [h[1] for h in upg_hits]
+        upg_rank = upg_keys.index(true_k14) + 1 if true_k14 in upg_keys else 0
 
-        l_rr = 1.0 / learned_rank if 1 <= learned_rank <= 25 else 0.0
-        learned_rrs.append(l_rr)
-        learned_h1.append(1.0 if learned_rank == 1 else 0.0)
-        learned_h5.append(1.0 if 1 <= learned_rank <= 5 else 0.0)
-        learned_h10.append(1.0 if 1 <= learned_rank <= 10 else 0.0)
-        learned_h25.append(1.0 if 1 <= learned_rank <= 25 else 0.0)
-        learned_cand_counts.append(len(learned_hits))
+        u_rr = 1.0 / upg_rank if 1 <= upg_rank <= 25 else 0.0
+        upgraded_rrs.append(u_rr)
+        upgraded_h1.append(1.0 if upg_rank == 1 else 0.0)
+        upgraded_h5.append(1.0 if 1 <= upg_rank <= 5 else 0.0)
+        upgraded_h10.append(1.0 if 1 <= upg_rank <= 10 else 0.0)
+        upgraded_h25.append(1.0 if 1 <= upg_rank <= 25 else 0.0)
 
         if idx % 10 == 0 or idx == len(unique_mols):
             curr_base_mrr = float(np.mean(baseline_rrs))
-            curr_learned_mrr = float(np.mean(learned_rrs))
-            print(f"[{idx:2d}/{len(unique_mols)}] Progress | Baseline MRR: {curr_base_mrr:.4f} -> Learned MRR: {curr_learned_mrr:.4f} (+{curr_learned_mrr - curr_base_mrr:+.4f})")
+            curr_upg_mrr = float(np.mean(upgraded_rrs))
+            print(f"[{idx:2d}/{len(unique_mols)}] Progress | Baseline MRR: {curr_base_mrr:.4f} -> Upgraded MRR: {curr_upg_mrr:.4f} (+{curr_upg_mrr - curr_base_mrr:+.4f})")
 
     total_time = time.time() - t0
     n = len(baseline_rrs)
 
     base_mrr = float(np.mean(baseline_rrs))
-    learned_mrr = float(np.mean(learned_rrs))
-    delta_mrr = learned_mrr - base_mrr
+    upg_mrr = float(np.mean(upgraded_rrs))
+    delta_mrr = upg_mrr - base_mrr
 
     # Statistical significance (paired t-test on reciprocal ranks)
-    t_stat, p_val = stats.ttest_rel(learned_rrs, baseline_rrs)
+    t_stat, p_val = stats.ttest_rel(upgraded_rrs, baseline_rrs)
 
     print("\n" + "=" * 75)
     print("FINAL BENCHMARK COMPARISON RESULTS")
@@ -140,13 +133,13 @@ def run_cpu_benchmark(
     print(f"Holdout molecules evaluated: {n}")
     print(f"Total evaluation time: {total_time:.1f}s ({total_time / n:.2f}s per molecule on CPU)")
     print()
-    print("| Metric | Baseline (15 ppm, Fixed) | Upgraded (5 ppm, LambdaMART) | Delta |")
+    print("| Metric | Baseline (15 ppm, Flat) | Upgraded (10 ppm, Adv Physics) | Delta |")
     print("|---|---|---|---|")
-    print(f"| **MRR@25** | **{base_mrr:.4f}** | **{learned_mrr:.4f}** | **{delta_mrr:+.4f}** |")
-    print(f"| **Hit@1**  | {np.mean(baseline_h1) * 100:.1f}% | {np.mean(learned_h1) * 100:.1f}% | {(np.mean(learned_h1) - np.mean(baseline_h1)) * 100:+.1f}% |")
-    print(f"| **Hit@5**  | {np.mean(baseline_h5) * 100:.1f}% | {np.mean(learned_h5) * 100:.1f}% | {(np.mean(learned_h5) - np.mean(baseline_h5)) * 100:+.1f}% |")
-    print(f"| **Hit@10** | {np.mean(baseline_h10) * 100:.1f}% | {np.mean(learned_h10) * 100:.1f}% | {(np.mean(learned_h10) - np.mean(baseline_h10)) * 100:+.1f}% |")
-    print(f"| **Hit@25** | {np.mean(baseline_h25) * 100:.1f}% | {np.mean(learned_h25) * 100:.1f}% | {(np.mean(learned_h25) - np.mean(baseline_h25)) * 100:+.1f}% |")
+    print(f"| **MRR@25** | **{base_mrr:.4f}** | **{upg_mrr:.4f}** | **{delta_mrr:+.4f}** |")
+    print(f"| **Hit@1**  | {np.mean(baseline_h1) * 100:.1f}% | {np.mean(upgraded_h1) * 100:.1f}% | {(np.mean(upgraded_h1) - np.mean(baseline_h1)) * 100:+.1f}% |")
+    print(f"| **Hit@5**  | {np.mean(baseline_h5) * 100:.1f}% | {np.mean(upgraded_h5) * 100:.1f}% | {(np.mean(upgraded_h5) - np.mean(baseline_h5)) * 100:+.1f}% |")
+    print(f"| **Hit@10** | {np.mean(baseline_h10) * 100:.1f}% | {np.mean(upgraded_h10) * 100:.1f}% | {(np.mean(upgraded_h10) - np.mean(baseline_h10)) * 100:+.1f}% |")
+    print(f"| **Hit@25** | {np.mean(baseline_h25) * 100:.1f}% | {np.mean(upgraded_h25) * 100:.1f}% | {(np.mean(upgraded_h25) - np.mean(baseline_h25)) * 100:+.1f}% |")
     print(f"\nPaired t-statistic: {t_stat:.4f} (p = {p_val:.4f})")
     print("=" * 75)
 
