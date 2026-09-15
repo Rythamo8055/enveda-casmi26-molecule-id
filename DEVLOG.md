@@ -472,8 +472,48 @@ Evaluated on 30 natural product molecules from `enveda-np-examples` (measured on
 **Key Takeaway**: Even without a single neural network weight loaded, this deterministic system correctly places the true molecule in the top-25 **76.7% of the time** on blind Class 2 retrieval. This creates an unshakeable safety floor for the entire solution.
 
 ### 4. Decisions Left for Next Steps
+- [x] **Tier 3 CPU De Novo Engine**: Implemented `src/models/de_novo_assembler.py` and integrated into `src/pipeline_v2.py`.
 - [ ] Run 15-minute 50K-sample test on Kaggle GPU using `notebooks/kaggle_gpu_train.py` to confirm neural convergence before launching full 500K run.
 - [ ] Proceed to P0-2: In-Silico Data Augmentation (FIORA / CFM-ID).
 
+---
 
+## Session 10: Tier 3 CPU De Novo Scaffold Assembly Completion & Full Pipeline Integration
+- **Date**: 2026-09-16
+- **Context**: Completing the CPU-based, deterministic solution for Class 3 novel structures (molecules completely absent from COCONUT, PubChem, and public libraries).
 
+### 1. User Request
+- Complete the CPU-related Tier 3 engine and integrate it directly into the end-to-end prediction pipeline.
+
+### 2. Implemented Architecture: Deterministic De Novo Scaffold Assembler (`src/models/de_novo_assembler.py`)
+
+1. **Natural Product Biosynthetic Transformation Library**:
+   - Built a reaction library of 13 primary natural product derivatizations:
+     - Hydroxylation ($+OH$, aromatic and aliphatic)
+     - Methylation ($+CH_3$, C-methyl, O-methyl, N-methyl)
+     - Methoxy addition ($+OCH_3$) and Demethylation ($-CH_3$)
+     - Acetylation ($+COCH_3$) and Carboxylation ($+COOH$)
+     - Prenylation ($+C_5H_8$, $+68.06$ Da) for terpenoid/alkaloid/flavonoid skeletons
+     - Carbonyl oxidation ($=O, +13.98$ Da)
+     - Hydrogenation ($+2H$) and Desaturation ($-2H$)
+     - Glycosylation ($+hexose, +162.05$ Da), Deoxyglycosylation ($+rhamnose, +146.06$ Da), and Pentosylation ($+pentose, +132.04$ Da).
+   - Added **2-step combinatorial derivations** (e.g. $+OH$ and $+CH_3$, $+2OH$, $+2CH_3$) to cover complex multi-substituent biosynthetic shifts.
+
+2. **Core Scaffold Discovery via Modified Cosine**:
+   - Coupled with `SpectralLibraryIndex.query_analog` to scan the 2.54M library for parent core scaffolds matching the query's fragmentation pattern under precursor mass shifts.
+
+3. **In-Silico Fragmentation & Exact Mass Scoring**:
+   - All proposed de novo structures are validated against exact neutral mass (< 15 ppm), sanitized with RDKit, deduplicated on canonical tautomer `InChIKey14`, and ranked by in-silico fragmentation explanation.
+
+4. **Pipeline Cascade Integration (`src/pipeline_v2.py`)**:
+   - Wired directly as Stage 3 of `predict_molecule`:
+     - If candidate slots (< 25) remain, or if retrieved database candidates have low confidence, Tier 3 De Novo assembly generates novel structures from seed scaffolds and injects them to fill the top-25 list.
+
+### 3. Empirical Verification Test
+- Simulated an unknown query with target mass $270.0528$ Da (Apigenin).
+- Seeded with Chrysin ($C_{15}H_{10}O_4$, $254.0579$ Da).
+- **Result**: The engine successfully synthesized **Apigenin** ($C_{15}H_{10}O_5$) along with its 5 position isomers, all matching the exact target mass within 0.0 ppm, and scored them by fragmentation.
+
+### 4. Decisions Left for Next Steps
+- [ ] Run 15-minute 50K-sample test on Kaggle GPU using `notebooks/kaggle_gpu_train.py` to confirm neural convergence before launching full 500K run.
+- [ ] Proceed to P0-2: In-Silico Data Augmentation (FIORA / CFM-ID).
