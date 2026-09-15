@@ -237,29 +237,49 @@ if __name__ == "__main__":
             ],
         )
 
-        print("Computing neutral masses...")
+        print("Computing neutral masses via vector mapping...")
+        # Map adduct strings to offsets
+        adduct_col = train_df["adduct"].to_list()
+        prec_col = train_df["precursor_mz"].to_numpy()
+
         neutral_masses = []
-        valid_indices = []
+        valid_mask = []
+        for prec, add in zip(prec_col, adduct_col):
+            off = ADDUCT_OFFSETS.get(add)
+            if off is not None and (prec - off) > 0:
+                neutral_masses.append(prec - off)
+                valid_mask.append(True)
+            else:
+                valid_mask.append(False)
 
-        for idx, row in enumerate(
-            train_df.select(["precursor_mz", "adduct"]).iter_rows(named=True)
-        ):
-            nm = calculate_neutral_mass(row["precursor_mz"], row["adduct"])
-            if nm is not None and nm > 0:
-                neutral_masses.append(nm)
-                valid_indices.append(idx)
+        valid_mask = np.array(valid_mask, dtype=bool)
+        print(f"Valid spectra with recognized adducts: {valid_mask.sum()} / {len(train_df)}")
 
-        print(f"Building spectral index with {len(valid_indices)} spectra...")
-        sub_train = train_df[valid_indices]
+        sub_train = train_df.filter(pl.Series(valid_mask))
+        neutral_masses = np.array(neutral_masses, dtype=np.float32)
+
+        # Prune each spectrum to top-128 peaks sorted by m/z for optimal speed and memory
+        print("Pruning peaks to top-128 and preparing index...")
+        pruned_mzs = []
+        pruned_ints = []
+        for mzs_raw, ints_raw in zip(sub_train["ms2_mzs"], sub_train["ms2_normalized_intensities"]):
+            m = np.array(mzs_raw, dtype=np.float32)
+            i = np.array(ints_raw, dtype=np.float32)
+            if len(m) > 128:
+                top_idx = np.argpartition(i, -128)[-128:]
+                top_idx = top_idx[np.argsort(m[top_idx])]
+                m = m[top_idx]
+                i = i[top_idx]
+            pruned_mzs.append(m)
+            pruned_ints.append(i)
+
+        print(f"Building spectral index with {len(sub_train)} spectra...")
         index = FastSpectralIndex(
-            neutral_masses=np.array(neutral_masses, dtype=np.float64),
+            neutral_masses=neutral_masses,
             smiles_list=sub_train["normalized_smiles"].to_list(),
             inchikey14_list=sub_train["inchikey14"].to_list(),
-            peak_mzs_list=[np.array(x, dtype=np.float64) for x in sub_train["ms2_mzs"]],
-            peak_intensities_list=[
-                np.array(x, dtype=np.float64)
-                for x in sub_train["ms2_normalized_intensities"]
-            ],
+            peak_mzs_list=pruned_mzs,
+            peak_intensities_list=pruned_ints,
         )
 
         print("Loading test data...")
