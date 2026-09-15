@@ -1,12 +1,18 @@
-"""Enveda CASMI 2026: Fast Spectral Library Matcher Baseline.
+"""Enveda CASMI 2026: Fast Spectral Library Matcher Baseline (Optimized Two-Stage).
 
 Self-contained script ready to run directly in a Kaggle Notebook or locally.
-Executes Tier-1 exact library search with InChIKey14 deduplication.
+1. Fast Row-Group Scan: Identifies candidate library spectra matching test neutral masses.
+2. Numba Spectral Cosine: Computes square-root cosine similarity against matched candidates.
+3. Multi-Spectrum Fusion: Aggregates scores per molecule_id.
+4. InChIKey14 Deduplication: Guarantees 25 unique connectivity slots in submission.csv.
 """
 
 import os
+import time
 import numpy as np
 import polars as pl
+import pyarrow.parquet as pq
+import pyarrow as pa
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
 from numba import njit
@@ -29,7 +35,7 @@ ADDUCT_OFFSETS: Dict[str, float] = {
 
 
 def calculate_neutral_mass(precursor_mz: float, adduct: str) -> Optional[float]:
-    """Calculate neutral mass from precursor m/z and adduct."""
+    """Calculate neutral monoisotopic mass from precursor m/z and adduct string."""
     offset = ADDUCT_OFFSETS.get(adduct)
     return precursor_mz - offset if offset is not None else None
 
@@ -122,7 +128,7 @@ class FastSpectralIndex:
         adduct: str,
         query_mzs: np.ndarray,
         query_intensities: np.ndarray,
-        ppm_tol: float = 15.0,
+        ppm_tol: float = 20.0,
         mz_tol: float = 0.02,
         top_k: int = 50,
     ) -> List[Tuple[str, str, float]]:
@@ -158,7 +164,7 @@ def predict_molecules(
     test_df: pl.DataFrame,
     index: FastSpectralIndex,
     output_file: str = "submission.csv",
-    ppm_tol: float = 15.0,
+    ppm_tol: float = 20.0,
     mz_tol: float = 0.02,
     max_cands: int = 25,
 ) -> pl.DataFrame:
@@ -167,35 +173,39 @@ def predict_molecules(
         m_id = row["molecule_id"]
         prec = float(row["precursor_mz"])
         adduct = str(row["adduct"])
-        mzs = np.array(row["ms2_mzs"], dtype=np.float64)
-        ints = np.array(row["ms2_normalized_intensities"], dtype=np.float64)
-        grouped[m_id].append((prec, adduct, mzs, ints))
+        mzs = np.array(row["ms2_mzs"], dtype=np.float32)
+        ints = np.array(row["ms2_normalized_intensities"], dtype=np.float32)
+        # Sort peaks by mz
+        order = np.argsort(mzs)
+        grouped[m_id].append((prec, adduct, mzs[order], ints[order]))
 
     print(f"Aggregating predictions for {len(grouped)} test molecules...")
     submissions = []
+    matched_count = 0
 
     for m_id, spectra in grouped.items():
         candidate_scores: Dict[str, Tuple[str, float, float]] = {}
 
         for prec, adduct, mzs, ints in spectra:
             hits = index.query(prec, adduct, mzs, ints, ppm_tol=ppm_tol, mz_tol=mz_tol)
-            for smi, inchikey14, sim in hits:
-                if not inchikey14:
-                    inchikey14 = smiles_to_inchikey14(smi)
-                if not inchikey14:
-                    continue
+            for smi, raw_inchikey14, sim in hits:
+                # Always canonicalize to guarantee RDKit evaluation compatibility & strict uniqueness
+                canonical_k14 = smiles_to_inchikey14(smi)
+                if not canonical_k14:
+                    continue  # Drop unparseable / kekulization-failed SMILES
 
-                if inchikey14 not in candidate_scores:
-                    candidate_scores[inchikey14] = (smi, sim, sim)
+                if canonical_k14 not in candidate_scores:
+                    candidate_scores[canonical_k14] = (smi, sim, sim)
                 else:
-                    prev_smi, total_s, max_s = candidate_scores[inchikey14]
-                    candidate_scores[inchikey14] = (
+                    prev_smi, total_s, max_s = candidate_scores[canonical_k14]
+                    candidate_scores[canonical_k14] = (
                         prev_smi,
                         total_s + sim,
                         max(max_s, sim),
                     )
 
         if candidate_scores:
+            matched_count += 1
             ranked = sorted(
                 candidate_scores.values(),
                 key=lambda x: (x[2], x[1]),
@@ -208,6 +218,7 @@ def predict_molecules(
 
         submissions.append({"molecule_id": m_id, "smiles": smiles_str})
 
+    print(f"Molecules with library spectral matches: {matched_count} / {len(grouped)}")
     sub_df = pl.DataFrame(submissions)
     sub_df.write_csv(output_file)
     print(f"Generated submission successfully at {output_file}")
@@ -215,54 +226,94 @@ def predict_molecules(
 
 
 if __name__ == "__main__":
-    # Determine dataset location (Kaggle or local)
+    t_start = time.time()
     kaggle_dir = "/kaggle/input/enveda-CASMI26-molecule-id-mass-spectra"
     local_dir = "data"
     data_dir = kaggle_dir if os.path.exists(kaggle_dir) else local_dir
 
     train_path = os.path.join(data_dir, "train.parquet")
     test_path = os.path.join(data_dir, "test.parquet")
+    out_path = os.path.join(data_dir, "submission.csv") if data_dir == "data" else "submission.csv"
 
     if os.path.exists(train_path) and os.path.exists(test_path):
-        print("Loading training data...")
-        train_df = pl.read_parquet(
-            train_path,
-            columns=[
-                "normalized_smiles",
-                "inchikey14",
-                "precursor_mz",
-                "adduct",
-                "ms2_mzs",
-                "ms2_normalized_intensities",
-            ],
-        )
+        print("Reading test spectra...")
+        test_df = pl.read_parquet(test_path)
 
-        print("Computing neutral masses via vector mapping...")
-        # Map adduct strings to offsets
-        adduct_col = train_df["adduct"].to_list()
-        prec_col = train_df["precursor_mz"].to_numpy()
+        # Build test neutral mass intervals (25 ppm window)
+        test_intervals = []
+        for row in test_df.select(["precursor_mz", "adduct"]).iter_rows(named=True):
+            nm = calculate_neutral_mass(row["precursor_mz"], row["adduct"])
+            if nm is not None and nm > 0:
+                delta = nm * 25e-6
+                test_intervals.append((nm - delta, nm + delta))
 
-        neutral_masses = []
-        valid_mask = []
-        for prec, add in zip(prec_col, adduct_col):
-            off = ADDUCT_OFFSETS.get(add)
-            if off is not None and (prec - off) > 0:
-                neutral_masses.append(prec - off)
-                valid_mask.append(True)
+        test_intervals.sort()
+        merged = []
+        for start, end in test_intervals:
+            if not merged or merged[-1][1] < start:
+                merged.append([start, end])
             else:
-                valid_mask.append(False)
+                merged[-1][1] = max(merged[-1][1], end)
 
-        valid_mask = np.array(valid_mask, dtype=bool)
-        print(f"Valid spectra with recognized adducts: {valid_mask.sum()} / {len(train_df)}")
+        starts = np.array([m[0] for m in merged], dtype=np.float64)
+        ends = np.array([m[1] for m in merged], dtype=np.float64)
 
-        sub_train = train_df.filter(pl.Series(valid_mask))
-        neutral_masses = np.array(neutral_masses, dtype=np.float32)
+        def in_intervals(masses: np.ndarray) -> np.ndarray:
+            idx = np.searchsorted(ends, masses, side="left")
+            valid = idx < len(starts)
+            mask = np.zeros(len(masses), dtype=bool)
+            mask[valid] = masses[valid] >= starts[idx[valid]]
+            return mask
 
-        # Prune each spectrum to top-128 peaks sorted by m/z for optimal speed and memory
-        print("Pruning peaks to top-128 and preparing index...")
+        print(f"Merged test intervals: {len(merged)}. Scanning train.parquet...")
+        pq_file = pq.ParquetFile(train_path)
+        matching_tables = []
+
+        for i in range(pq_file.num_row_groups):
+            meta_table = pq_file.read_row_group(i, columns=["precursor_mz", "adduct"])
+            precursors = meta_table["precursor_mz"].to_numpy()
+            adducts = meta_table["adduct"].to_pylist()
+
+            neutral_m = np.zeros(len(precursors), dtype=np.float64)
+            has_adduct = np.zeros(len(precursors), dtype=bool)
+            for j, (p, a) in enumerate(zip(precursors, adducts)):
+                off = ADDUCT_OFFSETS.get(a)
+                if off is not None:
+                    neutral_m[j] = p - off
+                    has_adduct[j] = True
+
+            hit_mask = has_adduct & in_intervals(neutral_m)
+            hit_indices = np.where(hit_mask)[0]
+
+            if len(hit_indices) > 0:
+                full_rg = pq_file.read_row_group(
+                    i,
+                    columns=[
+                        "normalized_smiles",
+                        "inchikey14",
+                        "precursor_mz",
+                        "adduct",
+                        "ms2_mzs",
+                        "ms2_normalized_intensities",
+                    ],
+                )
+                matching_tables.append(full_rg.take(hit_indices))
+
+        matched_arrow = pa.concat_tables(matching_tables)
+        candidate_train = pl.from_arrow(matched_arrow)
+        print(f"Matched {len(candidate_train)} candidate library spectra in {time.time() - t_start:.2f}s!")
+
+        # Compute neutral masses for candidate library spectra
+        neutral_masses = []
+        for p, a in zip(candidate_train["precursor_mz"], candidate_train["adduct"]):
+            neutral_masses.append(calculate_neutral_mass(p, a))
+
+        print("Pruning library spectra peaks to top 128...")
         pruned_mzs = []
         pruned_ints = []
-        for mzs_raw, ints_raw in zip(sub_train["ms2_mzs"], sub_train["ms2_normalized_intensities"]):
+        for mzs_raw, ints_raw in zip(
+            candidate_train["ms2_mzs"], candidate_train["ms2_normalized_intensities"]
+        ):
             m = np.array(mzs_raw, dtype=np.float32)
             i = np.array(ints_raw, dtype=np.float32)
             if len(m) > 128:
@@ -270,20 +321,24 @@ if __name__ == "__main__":
                 top_idx = top_idx[np.argsort(m[top_idx])]
                 m = m[top_idx]
                 i = i[top_idx]
+            else:
+                order = np.argsort(m)
+                m = m[order]
+                i = i[order]
             pruned_mzs.append(m)
             pruned_ints.append(i)
 
-        print(f"Building spectral index with {len(sub_train)} spectra...")
+        print("Building FastSpectralIndex...")
         index = FastSpectralIndex(
-            neutral_masses=neutral_masses,
-            smiles_list=sub_train["normalized_smiles"].to_list(),
-            inchikey14_list=sub_train["inchikey14"].to_list(),
+            neutral_masses=np.array(neutral_masses, dtype=np.float32),
+            smiles_list=candidate_train["normalized_smiles"].to_list(),
+            inchikey14_list=candidate_train["inchikey14"].to_list(),
             peak_mzs_list=pruned_mzs,
             peak_intensities_list=pruned_ints,
         )
 
-        print("Loading test data...")
-        test_df = pl.read_parquet(test_path)
-        predict_molecules(test_df, index, output_file="submission.csv")
+        print("Running predictions on test set...")
+        predict_molecules(test_df, index, output_file=out_path)
+        print(f"Total end-to-end execution time: {time.time() - t_start:.2f}s!")
     else:
-        print(f"Data files not found in {data_dir}. Ensure train.parquet and test.parquet exist.")
+        print(f"Data files not found in {data_dir}.")

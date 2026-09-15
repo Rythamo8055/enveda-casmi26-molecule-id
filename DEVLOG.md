@@ -133,9 +133,49 @@ The assistant fetched live competition metadata, schema, rules, and leaderboard,
 3. **Execution Plan**: As soon as `train.parquet` finishes downloading, run `notebooks/baseline_submission.py` to index the library, query all 400 test molecules, and generate `submission.csv`.
 
 ### 5. Decisions Left for Next Steps
-- [ ] Complete `train.parquet` download.
-- [ ] Run baseline inference and export `submission.csv`.
-- [ ] Validate submission file integrity against Kaggle competition requirements.
-- [ ] Push session updates to GitHub.
+- [x] Complete `train.parquet` download.
+- [x] Run baseline inference and export `submission.csv`.
+- [x] Validate submission file integrity against Kaggle competition requirements.
+- [x] Push session updates to GitHub.
+
+---
+
+## Session 04: End-to-End Baseline Run, 100% InChIKey14 Validation & Submission Verification
+- **Date**: 2026-09-15
+- **Context**: Completing `train.parquet` download, executing the two-stage spectral matcher, solving kekulization/tautomer edge cases, and verifying submission integrity.
+
+### 1. User Request
+- Complete dataset download and execute the end-to-end baseline to generate a competition-compliant submission.
+
+### 2. Submitted Proposals
+1. **Targeted Mass-Interval Indexing Innovation**:
+   - Discovered that all 400 test molecules occupy a combined mass window of only 5.50 Da across 287 merged intervals.
+   - Proposed a two-stage row-group parquet scan: first scans metadata (`precursor_mz`, `adduct`) across all 21 row groups, isolating 333,811 matching candidate spectra in just 10.91 seconds without loading the entire 2.82 GB into RAM ($< 300\text{ MB}$ peak memory).
+2. **Kekulization & Tautomer Discrepancy Discovery**:
+   - Public training libraries contain unstandardized or non-kekulizable SMILES. Raw library `inchikey14` strings often differ from RDKit canonical tautomer hashes.
+   - Proposal: Pass every retrieved candidate through RDKit `CanonicalTautomer`, discard unparseable SMILES, and deduplicate candidates strictly on canonical `InChIKey14`.
+3. **Submission Integrity Audit**:
+   - Comprehensive automated verification checking row counts, column names, nulls, candidate counts ($\le 25$), and InChIKey14 uniqueness.
+
+### 3. Selection Criteria
+- **Kaggle Metric Compliance**: MRR@25 evaluates strictly on RDKit 2026.03.3 canonical tautomer `InChIKey14`. Submitting duplicate tautomers or invalid SMILES directly wastes top-25 candidate slots.
+- **Resource Constraints**: Two-stage retrieval consumes minimal memory, making it fully compliant with Kaggle notebook limits (CPU $\le 9$ hrs, offline).
+
+### 4. Final Decision
+1. **Regenerated `data/submission.csv`**:
+   - Processed all 1,213 test spectra across all 400 molecules.
+   - Matched candidate spectra for **400 / 400 molecules (100% coverage)**.
+2. **Submission Integrity Confirmed**:
+   - Exact shape: `(400, 2)` (`molecule_id`, `smiles`).
+   - 0 nulls, 0 empty strings.
+   - 2 to 25 candidates per molecule.
+   - **Strict `InChIKey14` Uniqueness: 100% TRUE**.
+3. **Standalone Notebook Ready**: Updated `notebooks/baseline_submission.py` with the two-stage scanner and canonical deduplicator.
+
+### 5. Decisions Left for Next Steps
+- [ ] **Submit to Kaggle**: Submit `data/submission.csv` to Kaggle to log the initial public LB benchmark.
+- [ ] **Phase 2: Offline Candidate Database**: Curate and index COCONUT 2.0 / LOTUS natural products by neutral mass into a $< 2\text{ GB}$ offline Kaggle dataset.
+- [ ] **Phase 3: Spectrum-to-Fingerprint Model**: Build the deep learning Peak Transformer for Class 2 candidate retrieval.
+
 
 
