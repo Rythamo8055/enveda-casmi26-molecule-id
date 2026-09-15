@@ -1,266 +1,361 @@
-"""Tier-1 + Tier-2 Hybrid Pipeline: Library Matcher + Deep Neural Retrieval on COCONUT."""
+"""State-of-the-Art Hybrid Pipeline: Tier-1 Library Matcher + Contrastive Peak Transformer with RRF."""
 
 import os
 import time
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import polars as pl
 import torch
-from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
 
+from src.evaluation.metrics import smiles_to_inchikey14
+from src.models.peak_transformer import (
+    KNOWN_INSTRUMENTS,
+    MoleculeEncoder,
+    PeakTransformerEncoder,
+    compute_molecule_fingerprint,
+    get_instrument_idx,
+)
+from src.models.spectrum_dataset import parse_collision_energy
 from src.preprocessing.adducts import calculate_neutral_mass
 from src.retrieval.spectral_matcher import SpectralLibraryIndex as FastSpectralIndex
-from src.models.fingerprint_net import (
-    SpectrumFingerprintNet,
-    featurize_spectrum,
-    smiles_to_morgan_fingerprint,
-    continuous_tanimoto_similarity,
-)
 from src.retrieval.substructure_scorer import score_candidate_by_fragmentation
-from src.evaluation.metrics import smiles_to_inchikey14
 
 
-class HybridRetrievalPipeline:
+class ContrastiveHybridPipeline:
+    """Hybrid Retrieval Pipeline coupling Tier 1 (Library Matcher) with
+
+    Tier 2 (Contrastive Peak Transformer + COCONUT retrieval + RRF).
+    """
+
     def __init__(
         self,
-        spectral_index: FastSpectralIndex,
+        spectral_index: Optional[FastSpectralIndex] = None,
         coconut_parquet_path: str = "data/external/coconut_indexed.parquet",
-        model_weights_path: str = "models/fingerprint_net.pt",
+        spec_encoder_path: Optional[str] = "models/best_peak_transformer.pt",
+        mol_encoder_path: Optional[str] = "models/best_molecule_encoder.pt",
+        device: Optional[str] = None,
     ):
         self.spectral_index = spectral_index
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Load COCONUT natural products database
+        # 1. Load COCONUT index
         print(f"Loading COCONUT database from {coconut_parquet_path}...")
         self.coco_df = pl.read_parquet(coconut_parquet_path)
         self.coco_masses = self.coco_df["exact_mass"].to_numpy()
         self.coco_smiles = self.coco_df["clean_smiles"].to_list()
         self.coco_keys = self.coco_df["inchikey14"].to_list()
 
-        # Load SpectrumFingerprintNet
-        self.model = SpectrumFingerprintNet(in_features=4001, out_features=2048, hidden_dim=1024)
-        if os.path.exists(model_weights_path):
-            print(f"Loading neural fingerprint predictor from {model_weights_path}...")
-            self.model.load_state_dict(torch.load(model_weights_path, map_location="cpu"))
-        self.model.eval()
+        # Cache candidate fingerprints
+        self.fp_cache: Dict[str, np.ndarray] = {}
+
+        # 2. Load Peak Transformer & Molecule Encoder
+        self.spec_encoder = PeakTransformerEncoder(
+            d_model=256, n_heads=8, n_layers=4, d_feedforward=512, d_latent=512
+        ).to(self.device)
+        self.mol_encoder = MoleculeEncoder(
+            in_features=2048, d_feedforward=512, d_latent=512
+        ).to(self.device)
+
+        if spec_encoder_path and os.path.exists(spec_encoder_path):
+            print(
+                f"Loading Peak Transformer weights from {spec_encoder_path}..."
+            )
+            try:
+                self.spec_encoder.load_state_dict(
+                    torch.load(spec_encoder_path, map_location=self.device)
+                )
+            except Exception as e:
+                print(
+                    f"Warning: could not load spec encoder with standard dims ({e}), trying smoke-test dims..."
+                )
+                self.spec_encoder = PeakTransformerEncoder(
+                    d_model=128,
+                    n_heads=4,
+                    n_layers=2,
+                    d_feedforward=256,
+                    d_latent=256,
+                ).to(self.device)
+                self.spec_encoder.load_state_dict(
+                    torch.load(spec_encoder_path, map_location=self.device)
+                )
+
+        if mol_encoder_path and os.path.exists(mol_encoder_path):
+            print(f"Loading Molecule Encoder weights from {mol_encoder_path}...")
+            try:
+                self.mol_encoder.load_state_dict(
+                    torch.load(mol_encoder_path, map_location=self.device)
+                )
+            except Exception as e:
+                self.mol_encoder = MoleculeEncoder(
+                    in_features=2048, d_feedforward=256, d_latent=256
+                ).to(self.device)
+                self.mol_encoder.load_state_dict(
+                    torch.load(mol_encoder_path, map_location=self.device)
+                )
+
+        self.spec_encoder.eval()
+        self.mol_encoder.eval()
 
     def predict_molecule(
         self,
-        spectra: List[Tuple[float, str, np.ndarray, np.ndarray]],
+        spectra: List[Dict[str, any]],
         ppm_tol: float = 15.0,
         mz_tol: float = 0.02,
         max_cands: int = 25,
+        rrf_k: float = 60.0,
     ) -> str:
-        """Predict top 25 candidate SMILES for a single test molecule."""
-        candidate_scores: Dict[str, Tuple[str, float]] = {}  # InChIKey14 -> (SMILES, score)
+        """Predict top-25 unique canonical InChIKey14 candidate SMILES using multi-spectrum RRF."""
+        candidate_scores: Dict[str, Tuple[str, float]] = (
+            {}
+        )  # InChIKey14 -> (SMILES, aggregated_score)
 
-        # 1. Tier 1: Library Search against known spectra (train.parquet)
-        for prec, adduct, mzs, ints in spectra:
-            hits = self.spectral_index.query(prec, adduct, mzs, ints, ppm_tol=ppm_tol, mz_tol=mz_tol)
-            for smi, raw_k14, sim in hits:
-                if sim < 0.30:
-                    continue  # Ignore noisy library hits
-                k14 = smiles_to_inchikey14(smi)
-                if not k14:
-                    continue
-                # Give library hits a confidence multiplier
-                tier1_score = sim * 1.5
-                if k14 not in candidate_scores or tier1_score > candidate_scores[k14][1]:
-                    candidate_scores[k14] = (smi, tier1_score)
+        # ---------------------------------------------------------
+        # STAGE 1: Tier 1 Spectral Library Matcher (Class 1 hits)
+        # ---------------------------------------------------------
+        if self.spectral_index is not None:
+            for s in spectra:
+                prec = s["precursor_mz"]
+                adduct = s["adduct"]
+                mzs = s["mzs"]
+                ints = s["ints"]
+                hits = self.spectral_index.query(
+                    prec, adduct, mzs, ints, ppm_tol=ppm_tol, mz_tol=mz_tol
+                )
+                for smi, raw_k14, sim in hits:
+                    if sim < 0.35:
+                        continue
+                    k14 = smiles_to_inchikey14(smi)
+                    if not k14:
+                        continue
+                    # High-confidence Tier 1 score multiplier
+                    tier1_score = 5.0 + sim
+                    if (
+                        k14 not in candidate_scores
+                        or tier1_score > candidate_scores[k14][1]
+                    ):
+                        candidate_scores[k14] = (smi, tier1_score)
 
-        # 2. Tier 2: Neural Retrieval against COCONUT Natural Products Database
-        # Compute mean precursor neutral mass and average predicted fingerprint across spectra
+        # ---------------------------------------------------------
+        # STAGE 2: Tier 2 Contrastive Retrieval with RRF
+        # ---------------------------------------------------------
+        # Find candidate molecules from COCONUT matching precursor mass
         neutral_masses = []
-        pred_fps = []
-
-        for prec, adduct, mzs, ints in spectra:
-            nm = calculate_neutral_mass(prec, adduct)
+        for s in spectra:
+            nm = calculate_neutral_mass(s["precursor_mz"], s["adduct"])
             if nm is not None and nm > 0:
                 neutral_masses.append(nm)
 
-            feat = featurize_spectrum(mzs, ints, precursor_mz=prec)
-            with torch.no_grad():
-                pred = self.model(torch.from_numpy(feat).unsqueeze(0)).squeeze(0).numpy()
-            pred_fps.append(pred)
-
-        if neutral_masses and pred_fps:
-            mean_nm = float(np.mean(neutral_masses))
-            mean_pred_fp = np.mean(pred_fps, axis=0)
-
-            # Query COCONUT candidates within mass tolerance
+        if neutral_masses:
+            mean_nm = float(np.median(neutral_masses))
             delta = mean_nm * ppm_tol * 1e-6
             left = np.searchsorted(self.coco_masses, mean_nm - delta, side="left")
-            right = np.searchsorted(self.coco_masses, mean_nm + delta, side="right")
+            right = np.searchsorted(
+                self.coco_masses, mean_nm + delta, side="right"
+            )
 
-            # Representative spectrum for in-silico fragment explanation
-            rep_prec, rep_add, rep_mzs, rep_ints = spectra[0]
+            cand_smiles_slice = self.coco_smiles[left:right]
+            cand_keys_slice = self.coco_keys[left:right]
 
-            for idx in range(left, right):
-                c_smi = self.coco_smiles[idx]
-                c_k14 = self.coco_keys[idx]
+            # Collect candidate fingerprints
+            cand_fps_list = []
+            valid_cands = []
+            for c_smi, c_k14 in zip(cand_smiles_slice, cand_keys_slice):
+                if c_smi not in self.fp_cache:
+                    c_fp = compute_molecule_fingerprint(c_smi, n_bits=2048)
+                    self.fp_cache[c_smi] = (
+                        c_fp
+                        if c_fp is not None
+                        else np.zeros(2048, dtype=np.float32)
+                    )
+                fp_arr = self.fp_cache[c_smi]
+                if fp_arr.sum() > 0:
+                    cand_fps_list.append(fp_arr)
+                    valid_cands.append((c_smi, c_k14))
 
-                # Check if already captured with high confidence by Tier 1
-                if c_k14 in candidate_scores and candidate_scores[c_k14][1] >= 1.0:
-                    continue
+            if valid_cands:
+                cand_fps_tensor = torch.from_numpy(
+                    np.array(cand_fps_list, dtype=np.float32)
+                ).to(self.device)
+                with torch.no_grad():
+                    mol_latents = self.mol_encoder(
+                        cand_fps_tensor
+                    )  # (N_cands, d_latent)
 
-                c_fp = smiles_to_morgan_fingerprint(c_smi, n_bits=2048, radius=2)
-                if c_fp is None:
-                    continue
+                # Track Reciprocal Rank Fusion scores across spectra
+                # rrf_scores[idx] = sum_s (weight_s / (rrf_k + rank_s))
+                rrf_scores = np.zeros(len(valid_cands), dtype=np.float32)
 
-                tanimoto = continuous_tanimoto_similarity(mean_pred_fp, c_fp)
-                frag_score = score_candidate_by_fragmentation(
-                    c_smi, rep_mzs, rep_ints, precursor_mz=rep_prec
+                for s in spectra:
+                    mzs = s["mzs"]
+                    ints = s["ints"]
+                    prec_mz = s["precursor_mz"]
+                    ce_feat = s["ce_feat"]
+                    inst_idx = s["inst_idx"]
+
+                    # Information entropy of spectrum to weight clean, rich spectra higher
+                    if len(ints) > 0 and ints.sum() > 0:
+                        norm_ints = ints / ints.sum()
+                        spec_entropy = -float(
+                            np.sum(norm_ints * np.log(norm_ints + 1e-12))
+                        )
+                        spec_weight = 1.0 + min(spec_entropy / 3.0, 1.5)
+                    else:
+                        spec_weight = 1.0
+
+                    # Prepare peak tensors for Peak Transformer
+                    n_p = max(len(mzs), 1)
+                    padded_mzs = np.zeros((1, n_p), dtype=np.float32)
+                    padded_ints = np.zeros((1, n_p), dtype=np.float32)
+                    mask = np.zeros((1, n_p), dtype=bool)
+
+                    if len(mzs) > 0:
+                        padded_mzs[0, : len(mzs)] = mzs
+                        padded_ints[0, : len(ints)] = ints
+                        mask[0, : len(mzs)] = True
+
+                    with torch.no_grad():
+                        spec_latent, _ = self.spec_encoder(
+                            torch.from_numpy(padded_mzs).to(self.device),
+                            torch.from_numpy(padded_ints).to(self.device),
+                            torch.from_numpy(mask).to(self.device),
+                            torch.tensor([prec_mz], dtype=torch.float32).to(
+                                self.device
+                            ),
+                            torch.from_numpy(ce_feat).unsqueeze(0).to(
+                                self.device
+                            ),
+                            torch.tensor([inst_idx], dtype=torch.int64).to(
+                                self.device
+                            ),
+                        )
+                        # Cosine similarities: (1, d) @ (N, d).T -> (N,)
+                        sims = (
+                            torch.matmul(spec_latent, mol_latents.T)
+                            .squeeze(0)
+                            .cpu()
+                            .numpy()
+                        )
+
+                    # Determine ranking for this specific spectrum
+                    ranking_order = np.argsort(-sims)
+                    for rank, cand_idx in enumerate(ranking_order, start=1):
+                        rrf_scores[cand_idx] += spec_weight / (rrf_k + rank)
+
+                # Select best representative spectrum for in-silico fragmentation scoring
+                best_spec = max(
+                    spectra, key=lambda s: len(s["mzs"]) if s["mzs"] is not None else 0
                 )
+                rep_mzs = best_spec["mzs"]
+                rep_ints = best_spec["ints"]
+                rep_prec = best_spec["precursor_mz"]
 
-                # Combined Tier 2 score
-                tier2_score = 0.7 * tanimoto + 0.3 * frag_score
+                # Combine RRF score with expanded substructure scorer
+                for cand_idx, (c_smi, c_k14) in enumerate(valid_cands):
+                    # Skip if already high-confidence Tier 1 match
+                    if (
+                        c_k14 in candidate_scores
+                        and candidate_scores[c_k14][1] >= 5.0
+                    ):
+                        continue
 
-                # Strictly canonicalize InChIKey14 using RDKit canonical tautomer
-                canonical_k14 = smiles_to_inchikey14(c_smi)
-                if not canonical_k14:
-                    continue
+                    r_score = float(rrf_scores[cand_idx])
+                    frag_score = score_candidate_by_fragmentation(
+                        c_smi, rep_mzs, rep_ints, precursor_mz=rep_prec
+                    )
 
-                if canonical_k14 not in candidate_scores or tier2_score > candidate_scores[canonical_k14][1]:
-                    candidate_scores[canonical_k14] = (c_smi, tier2_score)
+                    # Tier 2 combined score: 70% contrastive RRF + 30% fragmentation explainer
+                    tier2_score = 0.7 * (r_score * 10.0) + 0.3 * frag_score
+
+                    canonical_k14 = smiles_to_inchikey14(c_smi)
+                    if not canonical_k14:
+                        continue
+
+                    if (
+                        canonical_k14 not in candidate_scores
+                        or tier2_score > candidate_scores[canonical_k14][1]
+                    ):
+                        candidate_scores[canonical_k14] = (c_smi, tier2_score)
 
         if not candidate_scores:
             return ""
 
-        # Rank all candidates by score descending
-        ranked = sorted(candidate_scores.values(), key=lambda x: x[1], reverse=True)
+        # Rank all unique canonical candidates by score descending
+        ranked = sorted(
+            candidate_scores.values(), key=lambda x: x[1], reverse=True
+        )
         top_smiles = [c[0] for c in ranked[:max_cands]]
         return ";".join(top_smiles)
 
 
-def run_hybrid_pipeline(
+def run_contrastive_hybrid_pipeline(
     test_parquet_path: str = "data/test.parquet",
-    train_parquet_path: str = "data/train.parquet",
     coconut_parquet_path: str = "data/external/coconut_indexed.parquet",
-    model_weights_path: str = "models/fingerprint_net.pt",
+    spec_encoder_path: str = "models/best_peak_transformer.pt",
+    mol_encoder_path: str = "models/best_molecule_encoder.pt",
     output_path: str = "data/submission_hybrid.csv",
 ) -> pl.DataFrame:
-    """Execute the full Tier-1 + Tier-2 hybrid pipeline and produce competition submission."""
+    """Execute end-to-end inference on test.parquet using Peak Transformer + RRF."""
     t0 = time.time()
-    from src.preprocessing.adducts import calculate_neutral_mass, ADDUCT_OFFSETS
-    from src.retrieval.spectral_matcher import SpectralLibraryIndex as FastSpectralIndex
-    import pyarrow.parquet as pq
-    import pyarrow as pa
+    print("Initializing Contrastive Hybrid Pipeline...")
 
-    print("Building Tier-1 FastSpectralIndex...")
+    pipeline = ContrastiveHybridPipeline(
+        spectral_index=None,  # Or pass FastSpectralIndex if train.parquet matching is desired
+        coconut_parquet_path=coconut_parquet_path,
+        spec_encoder_path=spec_encoder_path,
+        mol_encoder_path=mol_encoder_path,
+    )
+
+    print(f"Reading test spectra from {test_parquet_path}...")
     test_df = pl.read_parquet(test_parquet_path)
 
-    # Build test neutral mass intervals (25 ppm window)
-    test_intervals = []
-    for row in test_df.select(["precursor_mz", "adduct"]).iter_rows(named=True):
-        nm = calculate_neutral_mass(row["precursor_mz"], row["adduct"])
-        if nm is not None and nm > 0:
-            delta = nm * 25e-6
-            test_intervals.append((nm - delta, nm + delta))
-
-    test_intervals.sort()
-    merged = []
-    for start, end in test_intervals:
-        if not merged or merged[-1][1] < start:
-            merged.append([start, end])
-        else:
-            merged[-1][1] = max(merged[-1][1], end)
-
-    starts = np.array([m[0] for m in merged], dtype=np.float64)
-    ends = np.array([m[1] for m in merged], dtype=np.float64)
-
-    def in_intervals_local(masses: np.ndarray) -> np.ndarray:
-        idx = np.searchsorted(ends, masses, side="left")
-        valid = idx < len(starts)
-        mask = np.zeros(len(masses), dtype=bool)
-        mask[valid] = masses[valid] >= starts[idx[valid]]
-        return mask
-
-    pq_file = pq.ParquetFile(train_parquet_path)
-    matching_tables = []
-
-    for i in range(pq_file.num_row_groups):
-        meta_table = pq_file.read_row_group(i, columns=["precursor_mz", "adduct"])
-        precursors = meta_table["precursor_mz"].to_numpy()
-        adducts = meta_table["adduct"].to_pylist()
-
-        neutral_m = np.zeros(len(precursors), dtype=np.float64)
-        has_adduct = np.zeros(len(precursors), dtype=bool)
-        for j, (p, a) in enumerate(zip(precursors, adducts)):
-            off = ADDUCT_OFFSETS.get(a)
-            if off is not None:
-                neutral_m[j] = p - off
-                has_adduct[j] = True
-
-        hit_mask = has_adduct & in_intervals_local(neutral_m)
-        hit_indices = np.where(hit_mask)[0]
-
-        if len(hit_indices) > 0:
-            full_rg = pq_file.read_row_group(
-                i,
-                columns=[
-                    "normalized_smiles",
-                    "inchikey14",
-                    "precursor_mz",
-                    "adduct",
-                    "ms2_mzs",
-                    "ms2_normalized_intensities",
-                ],
-            )
-            matching_tables.append(full_rg.take(hit_indices))
-
-    matched_arrow = pa.concat_tables(matching_tables)
-    candidate_train = pl.from_arrow(matched_arrow)
-
-    neutral_masses = [
-        calculate_neutral_mass(p, a)
-        for p, a in zip(candidate_train["precursor_mz"], candidate_train["adduct"])
-    ]
-
-    pruned_mzs = []
-    pruned_ints = []
-    for mzs_raw, ints_raw in zip(
-        candidate_train["ms2_mzs"], candidate_train["ms2_normalized_intensities"]
-    ):
-        m = np.array(mzs_raw, dtype=np.float32)
-        i = np.array(ints_raw, dtype=np.float32)
-        if len(m) > 128:
-            top_idx = np.argpartition(i, -128)[-128:]
-            top_idx = top_idx[np.argsort(m[top_idx])]
-            m = m[top_idx]
-            i = i[top_idx]
-        else:
-            order = np.argsort(m)
-            m = m[order]
-            i = i[order]
-        pruned_mzs.append(m)
-        pruned_ints.append(i)
-
-    spectral_index = FastSpectralIndex(
-        neutral_masses=np.array(neutral_masses, dtype=np.float32),
-        smiles_list=candidate_train["normalized_smiles"].to_list(),
-        inchikey14_list=candidate_train["inchikey14"].to_list(),
-        peak_mzs_list=pruned_mzs,
-        peak_intensities_list=pruned_ints,
-    )
-
-    # Initialize Hybrid Pipeline
-    pipeline = HybridRetrievalPipeline(
-        spectral_index=spectral_index,
-        coconut_parquet_path=coconut_parquet_path,
-        model_weights_path=model_weights_path,
-    )
-
-    # Group test spectra by molecule_id
+    # Group spectra by molecule_id
     grouped = defaultdict(list)
     for row in test_df.iter_rows(named=True):
         m_id = row["molecule_id"]
         prec = float(row["precursor_mz"])
         adduct = str(row["adduct"])
-        mzs = np.array(row["ms2_mzs"], dtype=np.float32)
-        ints = np.array(row["ms2_normalized_intensities"], dtype=np.float32)
-        order = np.argsort(mzs)
-        grouped[m_id].append((prec, adduct, mzs[order], ints[order]))
+        mzs = np.array(
+            row["ms2_mzs"] if row["ms2_mzs"] is not None else [],
+            dtype=np.float32,
+        )
+        ints = np.array(
+            row["ms2_normalized_intensities"]
+            if row["ms2_normalized_intensities"] is not None
+            else [],
+            dtype=np.float32,
+        )
+        ce_feat = np.array(
+            parse_collision_energy(row.get("collision_energy_ev")),
+            dtype=np.float32,
+        )
+        inst_idx = get_instrument_idx(row.get("instrument_type"))
 
-    print(f"Executing Hybrid Prediction on {len(grouped)} molecules...")
+        if len(mzs) > 128:
+            top_idx = np.argpartition(ints, -128)[-128:]
+            order = np.argsort(mzs[top_idx])
+            mzs = mzs[top_idx][order]
+            ints = ints[top_idx][order]
+        elif len(mzs) > 0:
+            order = np.argsort(mzs)
+            mzs = mzs[order]
+            ints = ints[order]
+
+        grouped[m_id].append(
+            {
+                "precursor_mz": prec,
+                "adduct": adduct,
+                "mzs": mzs,
+                "ints": ints,
+                "ce_feat": ce_feat,
+                "inst_idx": inst_idx,
+            }
+        )
+
+    print(
+        f"Predicting candidates for {len(grouped)} molecules across {len(test_df)} test spectra..."
+    )
     results = []
     for m_id, spectra in grouped.items():
         smiles_str = pipeline.predict_molecule(spectra, ppm_tol=15.0)
@@ -268,9 +363,11 @@ def run_hybrid_pipeline(
 
     sub_df = pl.DataFrame(results)
     sub_df.write_csv(output_path)
-    print(f"Hybrid submission generated at {output_path} in {time.time()-t0:.2f}s!")
+    print(
+        f"Generated contrastive submission at {output_path} in {time.time()-t0:.2f}s!"
+    )
     return sub_df
 
 
 if __name__ == "__main__":
-    run_hybrid_pipeline()
+    run_contrastive_hybrid_pipeline()
