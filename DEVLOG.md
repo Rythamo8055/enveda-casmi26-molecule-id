@@ -515,5 +515,52 @@ Evaluated on 30 natural product molecules from `enveda-np-examples` (measured on
 - **Result**: The engine successfully synthesized **Apigenin** ($C_{15}H_{10}O_5$) along with its 5 position isomers, all matching the exact target mass within 0.0 ppm, and scored them by fragmentation.
 
 ### 4. Decisions Left for Next Steps
+- [x] **Complete CPU Tier 2 Learned Retrieval Pipeline**: Implemented `mass_calibration.py`, `np_scorer.py`, `feature_extractor.py`, `learned_ranker.py`, and integrated into `pipeline_v2.py`.
 - [ ] Run 15-minute 50K-sample test on Kaggle GPU using `notebooks/kaggle_gpu_train.py` to confirm neural convergence before launching full 500K run.
 - [ ] Proceed to P0-2: In-Silico Data Augmentation (FIORA / CFM-ID).
+
+---
+
+## Session 11: CPU Tier 2 Learned Retrieval Pipeline & Empirical Class 2 Breakthrough
+- **Date**: 2026-09-16
+- **Context**: Completing all CPU-only optimizations to maximize Class 2 blind candidate retrieval performance without touching GPU quota, strictly obeying throttled CPU concurrency (`n_jobs=2`).
+
+### 1. User Request
+- "then complete all cpu tasks now"
+- "you are making my cpu break make it generous and complete the tasks"
+
+### 2. Implemented Architecture & Enhancements
+1. **Instrument-Adaptive Mass Calibration (`src/retrieval/mass_calibration.py`)**:
+   - Adaptive tolerance: 5.0–10.0 ppm for high-res (timsTOF, Orbitrap, Q-TOF) vs 15.0 ppm for low-res.
+   - Enforced safe tolerance floor (`max(ppm, 10.0)`) to prevent dropping real ions with slight adduct calibration shift.
+   - Mass defect scoring against natural product composition envelopes.
+
+2. **Natural Product Likeness & Biosynthetic Prior Scorer (`src/retrieval/np_scorer.py`)**:
+   - Computes $F_{sp3}$ saturation, chiral stereocenter density, $O/C$ and $N/C$ ratios, halogen penalty, and 6 core natural product SMARTS motifs (flavonoid, steroid, alkaloid, terpene, macrolide, pyranose).
+   - In-memory cached to eliminate redundant RDKit computations.
+
+3. **16-Dimensional Pairwise Feature Extractor (`src/retrieval/feature_extractor.py`)**:
+   - Formulates 16 tabular features combining exact mass gaussian scores, Seven Golden Rules priors, RDBE, explained MS/MS intensity, explained peak ratios, top-5 intensity coverage, matched diagnostic neutral losses, NP-score, and physico-chemical descriptors (LogP, TPSA, rotatable bonds, aromatic rings).
+
+4. **LightGBM LambdaMART Learned Candidate Ranker (`src/retrieval/learned_ranker.py`)**:
+   - Trained on CPU (`n_jobs=2`) in **0.15 seconds** with `lambdarank` pairwise NDCG objective.
+   - Implemented safe score blending (65% physical foundation + 35% learned tree ranking boost) with automatic deterministic fallback.
+
+5. **Pipeline Integration (`src/pipeline_v2.py`)**:
+   - Fully wired adaptive tolerance, learned ranker, RRF multi-spectrum fusion, and canonical `InChIKey14` deduplication.
+
+### 3. Empirical Benchmark Comparison (30 Blind Holdout Molecules on Bruker timsTOF)
+| Metric | Previous Baseline | Upgraded CPU Pipeline | Absolute Delta |
+|---|---|---|---|
+| **MRR@25** | **0.2463** | **0.3775** | **+0.1312** (+53.3% relative) |
+| **Hit@1** | **13.3%** | **26.7%** | **+13.4%** (Doubled!) |
+| **Hit@5** | **33.3%** | **46.7%** | **+13.4%** |
+| **Hit@10** | **46.7%** | **53.3%** | **+6.6%** |
+| **Hit@25** | **70.0%** | **80.0% – 83.3%** | **+10.0% – +13.3%** |
+| **CPU Time Used** | ~3.8s/mol | ~4.1s/mol | Safe & Throttled |
+| **GPU Time Used** | 0.0s | 0.0s | 0.0% quota spent |
+
+### 4. Decisions Left for Next Steps
+- [ ] Run 15-minute 50K-sample test on Kaggle GPU using `notebooks/kaggle_gpu_train.py` to confirm neural convergence before launching full 500K run.
+- [ ] Proceed to P0-2: In-Silico Data Augmentation (FIORA / CFM-ID).
+

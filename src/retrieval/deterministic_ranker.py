@@ -22,6 +22,7 @@ from src.preprocessing.formula_generator import (
     FormulaCandidate,
 )
 from src.retrieval.substructure_scorer import score_candidate_by_fragmentation
+from src.retrieval.np_scorer import calculate_np_likeness
 from src.evaluation.metrics import smiles_to_inchikey14
 
 
@@ -55,7 +56,7 @@ class DeterministicCandidateRanker:
     def rank_candidates(
         self,
         spectra: List[Dict[str, any]],
-        ppm_tol: float = 15.0,
+        ppm_tol: float = 12.0,
         max_cands: int = 25,
     ) -> List[Tuple[str, str, float]]:
         """Rank candidates for a single molecule across all its spectra.
@@ -139,12 +140,16 @@ class DeterministicCandidateRanker:
             else:
                 mean_frag_score = 0.0
 
+            # Feature 4: Natural Product Likeness score
+            np_score = calculate_np_likeness(c_smi)
+
             # Composite deterministic ranking score:
-            # 50% fragmentation explanation + 30% formula match + 20% exact mass accuracy
+            # 45% fragmentation explanation + 25% formula match + 15% exact mass accuracy + 15% NP-likeness
             composite_score = (
-                0.50 * mean_frag_score
-                + 0.30 * min(formula_bonus, 1.0)
-                + 0.20 * mass_score
+                0.45 * mean_frag_score
+                + 0.25 * min(formula_bonus, 1.0)
+                + 0.15 * mass_score
+                + 0.15 * np_score
             )
 
             # Deduplicate by canonical skeleton (InChIKey14), keeping highest score

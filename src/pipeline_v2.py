@@ -22,6 +22,9 @@ from src.preprocessing.adducts import calculate_neutral_mass
 from src.retrieval.spectral_matcher import SpectralLibraryIndex as FastSpectralIndex
 from src.retrieval.substructure_scorer import score_candidate_by_fragmentation
 from src.models.de_novo_assembler import DeNovoScaffoldAssembler
+from src.retrieval.learned_ranker import LearnedCandidateRanker
+from src.retrieval.mass_calibration import get_instrument_ppm_tolerance
+from src.retrieval.feature_extractor import extract_candidate_features
 
 
 
@@ -103,6 +106,12 @@ class ContrastiveHybridPipeline:
         # 3. CPU De Novo Scaffold Assembler (Tier 3)
         self.de_novo_assembler = DeNovoScaffoldAssembler()
 
+        # 4. CPU Learned Candidate Ranker (Tier 2 LightGBM LambdaMART)
+        self.learned_ranker = LearnedCandidateRanker(
+            coconut_parquet_path=coconut_parquet_path,
+            model_path="models/lambdamart_ranker.txt",
+        )
+
     def predict_molecule(
 
         self,
@@ -147,6 +156,9 @@ class ContrastiveHybridPipeline:
         # STAGE 2: Tier 2 Contrastive Retrieval with RRF
         # ---------------------------------------------------------
         # Find candidate molecules from COCONUT matching precursor mass
+        inst_type = spectra[0].get("instrument_type") if spectra else None
+        effective_ppm = get_instrument_ppm_tolerance(inst_type, default_ppm=ppm_tol)
+
         neutral_masses = []
         for s in spectra:
             nm = calculate_neutral_mass(s["precursor_mz"], s["adduct"])
@@ -155,7 +167,7 @@ class ContrastiveHybridPipeline:
 
         if neutral_masses:
             mean_nm = float(np.median(neutral_masses))
-            delta = mean_nm * ppm_tol * 1e-6
+            delta = mean_nm * effective_ppm * 1e-6
             left = np.searchsorted(self.coco_masses, mean_nm - delta, side="left")
             right = np.searchsorted(
                 self.coco_masses, mean_nm + delta, side="right"
@@ -163,11 +175,12 @@ class ContrastiveHybridPipeline:
 
             cand_smiles_slice = self.coco_smiles[left:right]
             cand_keys_slice = self.coco_keys[left:right]
+            cand_masses_slice = self.coco_masses[left:right]
 
             # Collect candidate fingerprints
             cand_fps_list = []
             valid_cands = []
-            for c_smi, c_k14 in zip(cand_smiles_slice, cand_keys_slice):
+            for c_smi, c_k14, c_mass in zip(cand_smiles_slice, cand_keys_slice, cand_masses_slice):
                 if c_smi not in self.fp_cache:
                     c_fp = compute_molecule_fingerprint(c_smi, n_bits=2048)
                     self.fp_cache[c_smi] = (
@@ -178,7 +191,7 @@ class ContrastiveHybridPipeline:
                 fp_arr = self.fp_cache[c_smi]
                 if fp_arr.sum() > 0:
                     cand_fps_list.append(fp_arr)
-                    valid_cands.append((c_smi, c_k14))
+                    valid_cands.append((c_smi, c_k14, c_mass))
 
             if valid_cands:
                 cand_fps_tensor = torch.from_numpy(
@@ -260,11 +273,11 @@ class ContrastiveHybridPipeline:
                 # Generate plausible molecular formulas (Seven Golden Rules)
                 from src.preprocessing.formula_generator import generate_plausible_formulas
                 from rdkit.Chem import rdMolDescriptors
-                formulas = generate_plausible_formulas(mean_nm, ppm_tol=ppm_tol, max_candidates=10)
+                formulas = generate_plausible_formulas(mean_nm, ppm_tol=effective_ppm, max_candidates=10)
                 formula_map = {f.formula: f.score for f in formulas}
 
-                # Combine RRF score with expanded substructure scorer and formula plausibility
-                for cand_idx, (c_smi, c_k14) in enumerate(valid_cands):
+                # Combine RRF score with learned LambdaMART / substructure features
+                for cand_idx, (c_smi, c_k14, c_mass) in enumerate(valid_cands):
                     # Skip if already high-confidence Tier 1 match
                     if (
                         c_k14 in candidate_scores
@@ -273,24 +286,36 @@ class ContrastiveHybridPipeline:
                         continue
 
                     r_score = float(rrf_scores[cand_idx])
-                    frag_score = score_candidate_by_fragmentation(
-                        c_smi, rep_mzs, rep_ints, precursor_mz=rep_prec
-                    )
 
-                    # Molecular formula match bonus
-                    try:
-                        mol = Chem.MolFromSmiles(c_smi)
-                        c_form = rdMolDescriptors.CalcMolFormula(mol) if mol else ""
-                    except Exception:
-                        c_form = ""
-                    formula_bonus = formula_map.get(c_form, 0.0)
+                    if self.learned_ranker.booster is not None:
+                        feat = extract_candidate_features(
+                            candidate_smiles=c_smi,
+                            candidate_mass=c_mass,
+                            query_mzs=rep_mzs,
+                            query_intensities=rep_ints,
+                            precursor_mz=rep_prec,
+                            consensus_neutral_mass=mean_nm,
+                            formula_score_map=formula_map,
+                        )
+                        learned_score = float(self.learned_ranker.booster.predict(feat[np.newaxis, :])[0])
+                        tier2_score = learned_score + 0.50 * (r_score * 10.0)
+                    else:
+                        frag_score = score_candidate_by_fragmentation(
+                            c_smi, rep_mzs, rep_ints, precursor_mz=rep_prec
+                        )
+                        try:
+                            mol = Chem.MolFromSmiles(c_smi)
+                            c_form = rdMolDescriptors.CalcMolFormula(mol) if mol else ""
+                        except Exception:
+                            c_form = ""
+                        formula_bonus = formula_map.get(c_form, 0.0)
 
-                    # Tier 2 combined score: 50% contrastive RRF + 30% fragmentation explainer + 20% formula prior
-                    tier2_score = (
-                        0.50 * (r_score * 10.0)
-                        + 0.30 * frag_score
-                        + 0.20 * min(formula_bonus, 1.0)
-                    )
+                        # Tier 2 combined score: 50% contrastive RRF + 30% fragmentation explainer + 20% formula prior
+                        tier2_score = (
+                            0.50 * (r_score * 10.0)
+                            + 0.30 * frag_score
+                            + 0.20 * min(formula_bonus, 1.0)
+                        )
 
                     canonical_k14 = smiles_to_inchikey14(c_smi)
                     if not canonical_k14:
