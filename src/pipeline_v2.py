@@ -251,7 +251,13 @@ class ContrastiveHybridPipeline:
                 rep_ints = best_spec["ints"]
                 rep_prec = best_spec["precursor_mz"]
 
-                # Combine RRF score with expanded substructure scorer
+                # Generate plausible molecular formulas (Seven Golden Rules)
+                from src.preprocessing.formula_generator import generate_plausible_formulas
+                from rdkit.Chem import rdMolDescriptors
+                formulas = generate_plausible_formulas(mean_nm, ppm_tol=ppm_tol, max_candidates=10)
+                formula_map = {f.formula: f.score for f in formulas}
+
+                # Combine RRF score with expanded substructure scorer and formula plausibility
                 for cand_idx, (c_smi, c_k14) in enumerate(valid_cands):
                     # Skip if already high-confidence Tier 1 match
                     if (
@@ -265,8 +271,20 @@ class ContrastiveHybridPipeline:
                         c_smi, rep_mzs, rep_ints, precursor_mz=rep_prec
                     )
 
-                    # Tier 2 combined score: 70% contrastive RRF + 30% fragmentation explainer
-                    tier2_score = 0.7 * (r_score * 10.0) + 0.3 * frag_score
+                    # Molecular formula match bonus
+                    try:
+                        mol = Chem.MolFromSmiles(c_smi)
+                        c_form = rdMolDescriptors.CalcMolFormula(mol) if mol else ""
+                    except Exception:
+                        c_form = ""
+                    formula_bonus = formula_map.get(c_form, 0.0)
+
+                    # Tier 2 combined score: 50% contrastive RRF + 30% fragmentation explainer + 20% formula prior
+                    tier2_score = (
+                        0.50 * (r_score * 10.0)
+                        + 0.30 * frag_score
+                        + 0.20 * min(formula_bonus, 1.0)
+                    )
 
                     canonical_k14 = smiles_to_inchikey14(c_smi)
                     if not canonical_k14:
@@ -277,6 +295,7 @@ class ContrastiveHybridPipeline:
                         or tier2_score > candidate_scores[canonical_k14][1]
                     ):
                         candidate_scores[canonical_k14] = (c_smi, tier2_score)
+
 
         if not candidate_scores:
             return ""

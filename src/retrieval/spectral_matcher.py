@@ -133,3 +133,56 @@ class SpectralLibraryIndex:
         # Sort by similarity descending
         candidates.sort(key=lambda x: x[2], reverse=True)
         return candidates[:top_k]
+
+    def query_analog(
+        self,
+        precursor_mz: float,
+        adduct: str,
+        query_mzs: np.ndarray,
+        query_intensities: np.ndarray,
+        max_mass_shift: float = 80.0,
+        mz_tol: float = 0.02,
+        min_matched_peaks: int = 3,
+        top_k: int = 20,
+    ) -> List[Tuple[str, str, float]]:
+        """Find analog matches with precursor mass shifts (e.g. +OH, +CH3, +glycosyl)
+
+        using Modified Cosine.
+        """
+        from src.retrieval.modified_cosine import modified_cosine_similarity
+
+        query_neutral = calculate_neutral_mass(precursor_mz, adduct)
+        if query_neutral is None or query_neutral <= 0:
+            return []
+
+        min_m = max(query_neutral - max_mass_shift, 50.0)
+        max_m = query_neutral + max_mass_shift
+
+        left_idx = np.searchsorted(self.neutral_masses, min_m, side="left")
+        right_idx = np.searchsorted(self.neutral_masses, max_m, side="right")
+
+        if left_idx >= right_idx:
+            return []
+
+        # Subsample if search window is very large (> 2000 spectra)
+        total_in_window = right_idx - left_idx
+        step = max(total_in_window // 1000, 1)
+
+        candidates = []
+        for idx in range(left_idx, right_idx, step):
+            score, n_matched = modified_cosine_similarity(
+                query_mzs,
+                query_intensities,
+                query_neutral,
+                self.peak_mzs[idx],
+                self.peak_intensities[idx],
+                self.neutral_masses[idx],
+                mz_tolerance=mz_tol,
+                min_matched_peaks=min_matched_peaks,
+            )
+            if score > 0.40:
+                candidates.append((self.smiles[idx], self.inchikey14[idx], score))
+
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        return candidates[:top_k]
+
