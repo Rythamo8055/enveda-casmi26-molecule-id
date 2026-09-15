@@ -258,11 +258,113 @@ The assistant fetched live competition metadata, schema, rules, and leaderboard,
 - Synchronized all empirical findings to `DEVLOG.md` and GitHub.
 
 ### 5. Decisions Left for Next Steps
-- [ ] Create Kaggle dataset with `coconut_indexed.parquet` (13 MB) and `fingerprint_net.pt` (28 MB).
-- [ ] Build `notebooks/hybrid_submission.ipynb` for 1-click execution on Kaggle.
-- [ ] Begin Breakthrough 3 (De Novo Generative Model for Class 3).
+- [x] ~~Create Kaggle dataset with `coconut_indexed.parquet` (13 MB) and `fingerprint_net.pt` (28 MB).~~ **Superseded — old weights are invalid.**
+- [ ] Build new Kaggle notebook for Peak Transformer training run.
+- [ ] Begin contrastive learning architecture (P0 #1).
 
+---
 
+## Session 07: Honest Architecture Audit & Full Priority Roadmap Reset
+- **Date**: 2026-09-16
+- **Context**: Critical external review identified that Session 05–06 Tier 2 claims were inflated and the implementation is architecturally insufficient for competitive performance.
 
+### 1. User Request
+- Conduct an honest audit of all Tier 2 implementation claims.
+- Produce a prioritized implementation roadmap to reach 0.70–0.85 MRR@25.
+- Update the devlog with the corrected record.
+
+### 2. Audit Findings — Claim vs. Reality
+
+Every source file was reviewed. The following discrepancies were confirmed in code:
+
+| DEVLOG Claim | Reality | Code Evidence |
+|---|---|---|
+| "Deep Spectrum-to-Fingerprint Retrieval" | 2-layer MLP (4001→1024→1024→2048) with one residual skip | `fingerprint_net.py` L96–121 |
+| "Converging to 0.071 validation loss" | BCE loss on random 10% split — MRR@25 **never computed** | `train_fingerprint_net.py` L96–134 |
+| "Breakthrough for Class 2" | Model never tested on actual Class 2 molecules | Session 06 tests only 5 NP-example molecules |
+| "100% of test molecules have COCONUT matches" | 44 mass-matched candidates per molecule on average — ranking these correctly is the unsolved problem | `pipeline_v2.py` L90–92 |
+| "0.2772 blind MRR@25" | Computed on 5 molecules (n=5), 1 rank-1 hit. Not statistically meaningful. | Session 06 Proof 3 |
+
+**Root cause of each failure:**
+
+1. **Architecture**: Binning at 0.5 Da/bin destroys sub-Da resolution needed to distinguish isomers on high-res timsTOF. No attention over peaks. No cross-modal learning.
+2. **Training**: 30K samples / 5 epochs is a smoke test. The 2.54M spectra dataset was 98.8% unused. No learning rate schedule. No structure-disjoint split.
+3. **Featurization**: `precursor_mz - mz` neutral loss binning is identical to SIRIUS 2012. The field moved to subformula-level encoding in 2022 (MIST) and contrastive alignment in 2023 (FLARE, JESTR).
+4. **Multi-spectrum fusion**: `np.mean(pred_fps, axis=0)` averaging across collision energies destroys CE-specific diagnostic information. `collision_energy_ev` column exists in training data and was completely ignored.
+5. **Fragmentation scorer**: 12 hardcoded neutral losses, single-bond cleavage only. Real natural product fragmentation involves ring openings, retro-Diels-Alder, glycosidic bond losses, and hundreds of compound-class-specific rearrangements.
+6. **Metric mismatch**: BCE loss ≠ MRR@25. A model can have low BCE and random ranking. `calculate_mrr_at_k()` existed in `src/evaluation/metrics.py` but was never called during training.
+7. **Candidate ranking**: Fixed `0.7 * tanimoto + 0.3 * frag_score` is not learned and not optimized for MRR.
+
+### 3. Confirmed Data Statistics
+
+Full audit of `data/train.parquet` (2,539,608 spectra):
+
+| Statistic | Value |
+|---|---|
+| Total spectra | 2,539,608 |
+| Unique InChIKey14 | 275,810 |
+| Spectra with collision_energy_ev | 2,202,165 (87%) |
+| timsTOF spectra | 1,154,969 (45%) |
+| Orbitrap spectra | 745,562 (29%) |
+| NP library spectra (gnps+riken+massbank+mona+enveda-np) | 763,347 |
+| NP library unique molecules | 55,979 |
+| enveda-np-examples spectra (val holdout) | 1,184 |
+| Previous training used | 30,000 (1.2%) |
+
+### 4. Priority Roadmap
+
+Techniques are ordered by impact-to-effort ratio. Do not skip ahead.
+
+#### P0 — Must Do (Expected: +0.25–0.45 MRR)
+
+**P0-1: Contrastive Spectrum–Molecule Alignment**
+- Train a Transformer spectrum encoder + GNN/ChemBERTa molecule encoder with InfoNCE/NT-Xent contrastive loss
+- At inference: embed query spectrum, rank COCONUT candidates by cosine similarity
+- FLARE achieves 43% rank@1 on MassSpecGym using this approach
+- Expected gain: +0.20–0.35 MRR
+- Compute: Kaggle GPU, ~2–4 hours
+
+**P0-2: In-Silico Data Augmentation**
+- Use CFM-ID or FIORA to simulate spectra from 500K COCONUT/PubChem molecules
+- SEISMiQ trained on 41M simulated spectra → 29.8% top-1 on MassSpecGym
+- Expected gain: +0.10–0.20 MRR
+
+**P0-3: Multi-Spectrum Consensus Aggregation**
+- Option A: Reciprocal Rank Fusion across per-CE rankings
+- Option B: Entropy-weighted fingerprint averaging
+- Option C: Learned attention weighting
+- Expected gain: +0.05–0.10 MRR
+
+#### P1 — Should Do (Expected: +0.10–0.20 MRR)
+
+- **P1-4**: Ensemble of 3 architectures (MLP + GNN + Transformer) with learned weighting
+- **P1-5**: BPE SMILES tokenization for Class 3 de novo generation (MS2Mol-style)
+- **P1-6**: RAG-enhanced generation: retrieve top-10 nearest training spectra as few-shot context
+
+#### P2 — Nice to Have (Expected: +0.03–0.08 MRR)
+
+- **P2-7**: Masked peak pretraining (PRISM-style self-supervision on 2.5M spectra)
+- **P2-8**: Bond-breaking GNN (FIORA-style) for fragmentation scoring and data augmentation
+- **P2-9**: Collision energy conditioning on spectrum encoder (sinusoidal CE embedding)
+- **P2-10**: Candidate re-ranking head (LambdaMART on spectral cosine + fingerprint Tanimoto + formula score)
+
+#### Target Timeline
+
+| Week | Focus | Expected MRR |
+|---|---|---|
+| 1 | Contrastive model (P0-1) + data augmentation (P0-2) | 0.50–0.55 |
+| 2 | Multi-spectrum fusion (P0-3) + first Kaggle submission | 0.55–0.65 |
+| 3 | Ensemble (P1-4) + BPE generation (P1-5) | 0.65–0.75 |
+| 4 | RAG (P1-6) + P2 polish | 0.75–0.85 |
+
+### 5. Decisions Left for Next Steps
+- [ ] **P0-1**: Implement `src/models/peak_transformer.py` — sinusoidal m/z encoding, CE conditioning, instrument embedding, 4-layer Transformer, InfoNCE loss
+- [ ] **P0-1**: Implement `src/models/spectrum_dataset.py` — variable-length collation, structure-disjoint split, data augmentation
+- [ ] **P0-1**: Implement `src/models/train_peak_transformer.py` — 500K+ samples, 50 epochs, OneCycleLR, MRR@25 validation every 5 epochs
+- [ ] **P0-1**: Run training on Kaggle GPU (9-hour session), export weights
+- [ ] **Validation**: Implement `src/evaluation/validate_mrr.py` — full end-to-end MRR@25 on enveda-np-examples holdout
+- [ ] **Pipeline**: Update `src/pipeline_v2.py` to use contrastive encoder + RRF fusion + learned ranker
+- [ ] **P0-2**: Set up CFM-ID or FIORA for in-silico spectrum generation
+- [ ] **P0-3**: Implement RRF multi-spectrum fusion replacing naive averaging
 
 
