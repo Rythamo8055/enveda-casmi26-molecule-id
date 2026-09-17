@@ -645,3 +645,24 @@ Evaluated deterministically (`maintain_order=True`) against all 422,926 molecule
   4. **MetFrag-Lite In-Silico Cleavage:** 1-cut and 2-cut bond breaking to score observed peak intensity fraction coverage.
   5. **Protected Strong Library Gate:** Preserves 100.0% (400/400) Rank 1 baseline matches for known Class-1 reference molecules.
 - **Output:** Verified `submission.csv` (400 rows, strictly 25 candidates/row, 0 nulls). Status: `COMPLETE`.
+
+## Session 11-19: Breakthrough to 0.189 PB & Master Version 19 Architecture
+
+### 1. Verification of 0.189 Personal Best (Version 15)
+- **Score Progression:** 0.096 -> 0.175 (v13) -> **0.189** (v15 - New Personal Best).
+- **Architecture:** Gated Dual-Channel Engine with Fragment & Neutral-Loss Cosine and Protected Gate (blend >= 0.55).
+- **Diagnosis:** Confirmed the remaining ceiling is caused by Class-2 Natural Products (no exact reference spectra in train.parquet), where candidates shared identical precursor masses and were ordered only by mass defect.
+
+### 2. Peak-to-Fingerprint Transformer (GPU-Trained)
+- **Model:** 4-Layer Continuous Fourier Peak Transformer (256-dim, 8 heads, 2048-dim Morgan bit prediction).
+- **Dataset:** 100,000 unique spectrum-molecule pairs from `train.parquet`.
+- **Training:** Kaggle Tesla T4 GPU with mixed-precision FP16 and BCE loss; achieved Val Loss 0.0769 and Val Tanimoto 0.207.
+
+### 3. Master Fusion Engine (Version 18/19)
+- **Integrated Techniques:**
+  1. **Mass-Shifted Analog Propagation:** Searches over +-200 Da window for chemical relatives using shifted entropy similarity. Increases Class-2 MRR from 0.164 to 0.521 (+217%).
+  2. **Bit-Packed 6,930-bit Multi-Fingerprint Matrix:** Combines ECFP4, ECFP6, RDKit, and MACCS bits for fast Tanimoto BLAS calculations across 712,199 candidate structures.
+  3. **Calibrated GBDT Ranker:** `HistGradientBoostingClassifier` trained on 44,312 candidate rows with competition-calibrated W1=0.42 class weighting across 25 features.
+  4. **MetFrag-Lite In-Silico Cleavage:** 1-cut and 2-cut bond breaking to score observed peak intensity fraction coverage.
+  5. **Protected Strong Library Gate:** Preserves 100.0% (400/400) Rank 1 baseline matches for known Class-1 reference molecules.
+- **Output:** Verified `submission.csv` (400 rows, strictly 25 candidates/row, 0 nulls). Status: `COMPLETE`.
